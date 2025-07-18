@@ -166,7 +166,22 @@ documented in the following pages:
  - [Build instructions](doc/build.md)
  - [Developers](doc/develop.md)
 
+
 [wiki]: https://github.com/Genymobile/scrcpy/wiki
+
+## 專案結構
+
+以下列出專案中較重要的資料夾及其用途：
+
+- `app/` – 桌面端客戶端程式碼，使用 Meson 建置
+- `server/` – 在 Android 裝置上執行的伺服端程式
+- `assets/` – 文件中使用的圖片與圖示
+- `doc/` – 使用者與開發者相關文件
+- `config/` – 建置與檢查工具的設定檔
+- `release/` – 打包與發布版本的腳本
+- `gradle/` – 伺服端建置所需的 Gradle 包裝器
+- `run` – 協助以本機建置的程式啟動的腳本
+
 
 
 ## Articles
