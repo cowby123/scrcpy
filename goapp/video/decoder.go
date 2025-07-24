@@ -1,3 +1,4 @@
+// 利用 FFmpeg 將收到的 H264 資料解碼
 package video
 
 import (
@@ -6,14 +7,14 @@ import (
 	"github.com/giorgisio/goav/avutil"
 )
 
-// Decoder wraps an FFmpeg H264 decoder.
+// Decoder 包裝 FFmpeg 的 H264 解碼器
 type Decoder struct {
-	codecCtx *avcodec.Context
-	parser   *avcodec.ParserContext
-	frame    *avutil.Frame
+	codecCtx *avcodec.Context       // 解碼器上下文
+	parser   *avcodec.ParserContext // 用來解析 H264 串流
+	frame    *avutil.Frame          // 暫存解碼後的影格
 }
 
-// NewDecoder initializes the FFmpeg decoder for H.264 stream.
+// NewDecoder 初始化 H264 解碼器
 func NewDecoder() (*Decoder, error) {
 	codec := avcodec.AvcodecFindDecoder(avcodec.AV_CODEC_ID_H264)
 	if codec == nil {
@@ -30,7 +31,7 @@ func NewDecoder() (*Decoder, error) {
 	return &Decoder{codecCtx: c, parser: parser, frame: avutil.AvFrameAlloc()}, nil
 }
 
-// Decode decodes a packet of H264 data and returns whether a frame is ready.
+// Decode 解碼一個 H264 資料包，若成功取得影格則回傳
 func (d *Decoder) Decode(data []byte) (*avutil.Frame, bool, error) {
 	var gotFrame int
 	avPacket := avcodec.AvPacketAlloc()
