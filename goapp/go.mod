@@ -1,11 +1,35 @@
 module github.com/yourname/scrcpy-go
 
-go 1.20
+go 1.23.0
+
+toolchain go1.23.2
 
 require (
-    github.com/veandco/go-sdl2 v0.5.0
-    github.com/zach-klippenstein/goadb v0.0.0-20190708045414-0c5a9476c072
-    github.com/giorgisio/goav v0.0.0-20190406074633-da1bdd5a0d3e
-    github.com/go-vgo/robotgo v0.100.5
+	github.com/dblohm7/wingoes v0.0.0-20240820181039-f2b84150679e // indirect
+	github.com/ebitengine/purego v0.8.3 // indirect
+	github.com/gen2brain/shm v0.1.1 // indirect
+	github.com/giorgisio/goav v0.1.0 // indirect
+	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/go-vgo/robotgo v0.110.8 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
+	github.com/jezek/xgb v1.1.1 // indirect
+	github.com/lufia/plan9stats v0.0.0-20250317134145-8bc96cf8fc35 // indirect
+	github.com/otiai10/gosseract v2.2.1+incompatible // indirect
+	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
+	github.com/robotn/xgb v0.10.0 // indirect
+	github.com/robotn/xgbutil v0.10.0 // indirect
+	github.com/shirou/gopsutil/v4 v4.25.4 // indirect
+	github.com/tailscale/win v0.0.0-20250213223159-5992cb43ca35 // indirect
+	github.com/tklauser/go-sysconf v0.3.15 // indirect
+	github.com/tklauser/numcpus v0.10.0 // indirect
+	github.com/vcaesar/gops v0.41.0 // indirect
+	github.com/vcaesar/imgo v0.41.0 // indirect
+	github.com/vcaesar/keycode v0.10.1 // indirect
+	github.com/vcaesar/screenshot v0.11.1 // indirect
+	github.com/vcaesar/tt v0.20.1 // indirect
+	github.com/veandco/go-sdl2 v0.4.40 // indirect
+	github.com/yusufpapurcu/wmi v1.2.4 // indirect
+	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
+	golang.org/x/image v0.27.0 // indirect
+	golang.org/x/sys v0.33.0 // indirect
 )
-
