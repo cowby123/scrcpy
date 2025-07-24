@@ -1,10 +1,11 @@
+// 利用 SDL2 將解碼後的影像顯示在視窗中
 package video
 
 import (
 	"github.com/veandco/go-sdl2/sdl"
 )
 
-// Display uses SDL2 to show frames decoded from the video stream.
+// Display 使用 SDL2 顯示從影片串流解碼出的影格
 type Display struct {
 	window   *sdl.Window
 	renderer *sdl.Renderer
@@ -13,7 +14,7 @@ type Display struct {
 	height   int
 }
 
-// NewDisplay creates the SDL window and renderer.
+// NewDisplay 建立 SDL 視窗與繪圖器
 func NewDisplay(title string, w, h int) (*Display, error) {
 	if err := sdl.Init(sdl.INIT_VIDEO); err != nil {
 		return nil, err
@@ -34,7 +35,7 @@ func NewDisplay(title string, w, h int) (*Display, error) {
 	return &Display{window: win, renderer: rend, texture: tex, width: w, height: h}, nil
 }
 
-// Render writes a YUV frame to the texture and updates the screen.
+// Render 將 YUV 影格寫入紋理並更新畫面
 func (d *Display) Render(yuv []byte) error {
 	d.texture.Update(nil, yuv, d.width)
 	d.renderer.Copy(d.texture, nil, nil)
@@ -42,7 +43,7 @@ func (d *Display) Render(yuv []byte) error {
 	return nil
 }
 
-// Poll handles SDL events to keep the window responsive.
+// Poll 處理事件以維持視窗運作
 func (d *Display) Poll() bool {
 	for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
 		switch event.(type) {
@@ -54,7 +55,7 @@ func (d *Display) Poll() bool {
 	return true
 }
 
-// Close destroys SDL resources.
+// Close 釋放 SDL 資源
 func (d *Display) Close() {
 	d.texture.Destroy()
 	d.renderer.Destroy()

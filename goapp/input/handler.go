@@ -1,3 +1,4 @@
+// 處理鍵盤與滑鼠輸入事件
 package input
 
 import (
@@ -5,8 +6,7 @@ import (
 	"github.com/veandco/go-sdl2/sdl"
 )
 
-// Event represents a simplified control event that will be encoded
-// and sent to the scrcpy server.
+// Event 描述將來要傳送給 scrcpy 伺服器的控制事件
 type Event struct {
 	Type   string
 	Key    sdl.Keycode
@@ -14,7 +14,7 @@ type Event struct {
 	X, Y   int32
 }
 
-// Capture polls SDL for keyboard/mouse events and converts them to Event.
+// Capture 從 SDL 取得鍵盤與滑鼠事件並轉換成 Event
 func Capture() []Event {
 	var events []Event
 	for e := sdl.PollEvent(); e != nil; e = sdl.PollEvent() {
@@ -30,7 +30,7 @@ func Capture() []Event {
 	return events
 }
 
-// Example of sending a key via robotgo (used for OTG mode).
+// 使用 robotgo 直接在主機端產生按鍵（OTG 模式範例）
 func SendKey(code string) {
 	robotgo.KeyTap(code)
 }
