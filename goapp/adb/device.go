@@ -83,3 +83,17 @@ func (d *Device) Forward(local string) error {
 	}
 	return nil
 }
+
+// Reverse 在裝置端建立連線，使其回連至本機指定的埠號
+func (d *Device) Reverse(remote, local string) error {
+	args := []string{}
+	if d.serial != "" {
+		args = append(args, "-s", d.serial)
+	}
+	args = append(args, "reverse", remote, local)
+	cmd := exec.Command("adb", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("reverse: %w (%s)", err, string(out))
+	}
+	return nil
+}
