@@ -8,7 +8,7 @@ import (
 )
 
 // scrcpy 伺服器檔案的路徑
-const serverJar = "../assets/scrcpy-server"
+const serverJar = "./assets/scrcpy-server"
 
 func main() {
 	// 連線到第一台可用的裝置

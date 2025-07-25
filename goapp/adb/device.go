@@ -57,7 +57,7 @@ func (d *Device) StartServer() (io.ReadCloser, error) {
 	if d.serial != "" {
 		args = append(args, "-s", d.serial)
 	}
-	args = append(args, "shell", "CLASSPATH=/data/local/tmp/scrcpy-server.jar", "app_process", "/", "com.genymobile.scrcpy.Server", "1.25")
+	args = append(args, "shell", "CLASSPATH=/data/local/tmp/scrcpy-server.jar", "app_process", "/", "com.genymobile.scrcpy.Server", "3.3.1")
 	cmd := exec.Command("adb", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
