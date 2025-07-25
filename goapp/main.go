@@ -17,6 +17,11 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// 透過 adb reverse 將裝置連線轉回本機，便於伺服器傳送資料
+	if err := dev.Reverse("localabstract:scrcpy", "tcp:27183"); err != nil {
+		log.Fatal("reverse:", err)
+	}
+
 	// 將伺服器檔案推送至裝置暫存目錄
 	if err := dev.PushServer(serverJar); err != nil {
 		log.Fatal("push server:", err)
