@@ -5,10 +5,9 @@ go 1.23.0
 toolchain go1.23.2
 
 require (
-	github.com/giorgisio/goav v0.1.0
-	github.com/go-vgo/robotgo v0.110.8
-	github.com/veandco/go-sdl2 v0.4.12
-	github.com/zach-klippenstein/goadb v0.0.0-20201208042340-620e0e950ed7
+        github.com/giorgisio/goav v0.1.0
+        github.com/go-vgo/robotgo v0.110.8
+        github.com/veandco/go-sdl2 v0.4.12
 )
 
 require (
