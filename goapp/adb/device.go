@@ -4,6 +4,7 @@ package adb
 import (
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 )
@@ -52,22 +53,32 @@ func (d *Device) PushServer(localPath string) error {
 }
 
 // StartServer 透過 adb shell 啟動 scrcpy 伺服器並回傳串流
-func (d *Device) StartServer() (io.ReadCloser, error) {
+func (d *Device) StartServer() (io.ReadWriteCloser, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:27183")
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+
 	args := []string{}
 	if d.serial != "" {
 		args = append(args, "-s", d.serial)
 	}
-	args = append(args, "shell", "CLASSPATH=/data/local/tmp/scrcpy-server.jar", "app_process", "/", "com.genymobile.scrcpy.Server", "3.3.1")
+	args = append(args, "shell", "CLASSPATH=/data/local/tmp/scrcpy-server", "app_process", "/", "com.genymobile.scrcpy.Server")
 	cmd := exec.Command("adb", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("start server pipe: %w", err)
-	}
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
+		ln.Close()
 		return nil, fmt.Errorf("start server: %w", err)
 	}
-	return &cmdReadCloser{ReadCloser: stdout, cmd: cmd}, nil
+	go cmd.Wait()
+
+	conn, err := ln.Accept()
+	ln.Close()
+	if err != nil {
+		return nil, fmt.Errorf("accept: %w", err)
+	}
+
+	return conn, nil
 }
 
 // Forward 在本地建立與 scrcpy 通道的連線轉發
