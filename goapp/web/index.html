@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>scrcpy WebRTC</title>
+</head>
+<body>
+<video id="v" autoplay playsinline controls></video>
+<script>
+const pc = new RTCPeerConnection();
+pc.ontrack = ev => {
+    document.getElementById('v').srcObject = ev.streams[0];
+};
+pc.addTransceiver('video', {direction:'recvonly'});
+async function start(){
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const res = await fetch('/offer', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(pc.localDescription)
+    });
+    const answer = await res.json();
+    await pc.setRemoteDescription(answer);
+}
+start();
+</script>
+</body>
+</html>
