@@ -105,5 +105,5 @@ func main() {
 	fs := http.FileServer(http.Dir("./web"))
 	http.Handle("/", fs)
 	log.Println("open http://localhost:8080 to view stream")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8081", nil))
 }
