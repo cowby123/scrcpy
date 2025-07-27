@@ -5,12 +5,13 @@ go 1.23.0
 toolchain go1.23.2
 
 require (
-        github.com/giorgisio/goav v0.1.0
-        github.com/go-vgo/robotgo v0.110.8
-        github.com/veandco/go-sdl2 v0.4.12
+	github.com/giorgisio/goav v0.1.0
+	github.com/go-vgo/robotgo v0.110.8
+	github.com/veandco/go-sdl2 v0.4.12
 )
 
 require (
+	github.com/3d0c/gmf v0.0.0-20220906170454-be727bc5b56c // indirect
 	github.com/dblohm7/wingoes v0.0.0-20240820181039-f2b84150679e // indirect
 	github.com/ebitengine/purego v0.8.3 // indirect
 	github.com/gen2brain/shm v0.1.1 // indirect
