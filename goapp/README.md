@@ -6,7 +6,7 @@ scrcpy 伺服器並在本機端顯示裝置畫面。
 ## 需求
 - Go 1.20 以上
 - 已安裝 `adb` 並可與 Android 裝置連線
-- 系統需能安裝 SDL2、FFmpeg 以及 robotgo 相關依賴
+- 系統需能安裝 SDL2、FFmpeg（提供 gmf 使用）以及 robotgo 相關依賴
 
 ## 執行方式
 ```bash
@@ -17,7 +17,8 @@ go run .
 將裝置的 `localabstract:scrcpy` 轉發至本機 `tcp:27183`，接著啟動伺服器，
 之後會開啟視窗顯示畫面，並於終端輸出錯誤訊息（若有）。
 
-此範例僅提供影片顯示功能，輸入事件捕捉後並未送回裝置，可依需求在
+範例中使用 `github.com/3d0c/gmf` 實作影片解碼器，並在主程式中解析
+伺服器傳回的影像封包。輸入事件捕捉後尚未送回裝置，可依需求在
 `input` 與 `protocol` 套件中擴充。
 
 sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config
