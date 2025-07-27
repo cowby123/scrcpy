@@ -2,9 +2,17 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"log"
+	"net/http"
+	"time"
+
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/yourname/scrcpy-go/adb"
+	"github.com/yourname/scrcpy-go/protocol"
 )
 
 // scrcpy 伺服器檔案的路徑
@@ -34,42 +42,74 @@ func main() {
 	}
 	defer stream.Close()
 
-	// // 初始化影片解碼器
-	// dec, err := video.NewDecoder()
-	// if err != nil {
-	// 	log.Fatal("init decoder:", err)
-	// }
+	// 建立 HTTP 伺服器，透過 WebRTC 將影片串流給瀏覽器
+	http.HandleFunc("/offer", func(w http.ResponseWriter, r *http.Request) {
+		var offer webrtc.SessionDescription
+		if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	// // 建立顯示視窗
-	// disp, err := video.NewDisplay("scrcpy-go", 720, 1280)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// defer disp.Close()
+		m := &webrtc.MediaEngine{}
+		m.RegisterDefaultCodecs()
+		api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
-	// // 主迴圈：讀取封包、顯示畫面並處理輸入
-	// for {
-	// 	pkt, err := protocol.Decode(stream)
-	// 	if err != nil {
-	// 		log.Println("read:", err)
-	// 		break
-	// 	}
-	// 	if pkt.Type == 0 { // 視訊封包
-	// 		frame, ok, err := dec.Decode(pkt.Body)
-	// 		if err != nil {
-	// 			log.Println("decode:", err)
-	// 			continue
-	// 		}
-	// 		if ok { // 取得完整畫面後進行渲染
-	// 			videoData := frame.Data()
-	// 			disp.Render(videoData)
-	// 		}
-	// 	}
-	// 	// 取得鍵盤滑鼠事件（尚未傳送回裝置）
-	// 	events := input.Capture()
-	// 	_ = events // 未來可透過 encoder 發送控制訊息
-	// 	if !disp.Poll() {
-	// 		break
-	// 	}
-	// }
+		pc, err := api.NewPeerConnection(webrtc.Configuration{})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		track, err := webrtc.NewTrackLocalStaticSample(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+			"video", "scrcpy")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := pc.AddTrack(track); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := pc.SetRemoteDescription(offer); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		answer, err := pc.CreateAnswer(nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := pc.SetLocalDescription(answer); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		<-webrtc.GatheringCompletePromise(pc)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(pc.LocalDescription())
+
+		go func() {
+			for {
+				pkt, err := protocol.Decode(stream)
+				if err != nil {
+					if err != io.EOF {
+						log.Println("stream read:", err)
+					}
+					return
+				}
+				if pkt.Type == 0 {
+					if err := track.WriteSample(media.Sample{Data: pkt.Body, Duration: time.Second / 60}); err != nil {
+						log.Println("track sample:", err)
+						return
+					}
+				}
+			}
+		}()
+	})
+
+	fs := http.FileServer(http.Dir("./web"))
+	http.Handle("/", fs)
+	log.Println("open http://localhost:8080 to view stream")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
