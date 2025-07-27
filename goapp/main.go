@@ -2,9 +2,11 @@
 package main
 
 import (
-	"log"
+        "log"
 
-	"github.com/yourname/scrcpy-go/adb"
+        "github.com/yourname/scrcpy-go/adb"
+        "github.com/yourname/scrcpy-go/protocol"
+        "github.com/yourname/scrcpy-go/video"
 )
 
 // scrcpy 伺服器檔案的路徑
@@ -33,12 +35,12 @@ func main() {
 		log.Fatal("start server:", err)
 	}
 	defer stream.Close()
-
-	// // 初始化影片解碼器
-	// dec, err := video.NewDecoder()
-	// if err != nil {
-	// 	log.Fatal("init decoder:", err)
-	// }
+        // 初始化影片解碼器
+        dec, err := video.NewDecoder()
+        if err != nil {
+                log.Fatal("init decoder:", err)
+        }
+        defer dec.Close()
 
 	// // 建立顯示視窗
 	// disp, err := video.NewDisplay("scrcpy-go", 720, 1280)
@@ -47,29 +49,23 @@ func main() {
 	// }
 	// defer disp.Close()
 
-	// // 主迴圈：讀取封包、顯示畫面並處理輸入
-	// for {
-	// 	pkt, err := protocol.Decode(stream)
-	// 	if err != nil {
-	// 		log.Println("read:", err)
-	// 		break
-	// 	}
-	// 	if pkt.Type == 0 { // 視訊封包
-	// 		frame, ok, err := dec.Decode(pkt.Body)
-	// 		if err != nil {
-	// 			log.Println("decode:", err)
-	// 			continue
-	// 		}
-	// 		if ok { // 取得完整畫面後進行渲染
-	// 			videoData := frame.Data()
-	// 			disp.Render(videoData)
-	// 		}
-	// 	}
-	// 	// 取得鍵盤滑鼠事件（尚未傳送回裝置）
-	// 	events := input.Capture()
-	// 	_ = events // 未來可透過 encoder 發送控制訊息
-	// 	if !disp.Poll() {
-	// 		break
-	// 	}
-	// }
+	        // 主迴圈：讀取封包並解碼畫面
+        for {
+                pkt, err := protocol.Decode(stream)
+                if err != nil {
+                        log.Println("read:", err)
+                        break
+                }
+                if pkt.Type == 0 {
+                        frame, ok, err := dec.Decode(pkt.Body)
+                        if err != nil {
+                                log.Println("decode:", err)
+                                continue
+                        }
+                        if ok {
+                                log.Printf("frame %dx%d", frame.Width(), frame.Height())
+                                frame.Free()
+                        }
+                }
+        }
 }
