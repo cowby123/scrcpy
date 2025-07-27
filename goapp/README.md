@@ -19,3 +19,5 @@ go run .
 
 此範例僅提供影片顯示功能，輸入事件捕捉後並未送回裝置，可依需求在
 `input` 與 `protocol` 套件中擴充。
+
+sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev pkg-config
