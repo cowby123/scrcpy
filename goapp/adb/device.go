@@ -52,12 +52,19 @@ func (d *Device) PushServer(localPath string) error {
 	return nil
 }
 
-// StartServer 透過 adb shell 啟動 scrcpy 伺服器並回傳串流
-func (d *Device) StartServer() (io.ReadWriteCloser, error) {
+// ServerConn 代表與 scrcpy server 的連線
+type ServerConn struct {
+	VideoStream io.ReadWriteCloser
+	Control     io.ReadWriteCloser
+}
+
+// StartServer 透過 adb shell 啟動 scrcpy 伺服器並回傳視訊串流和控制通道
+func (d *Device) StartServer() (*ServerConn, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:27183")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
+	defer ln.Close()
 
 	args := []string{}
 	if d.serial != "" {
@@ -67,18 +74,27 @@ func (d *Device) StartServer() (io.ReadWriteCloser, error) {
 	cmd := exec.Command("adb", args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		ln.Close()
 		return nil, fmt.Errorf("start server: %w", err)
 	}
 	go cmd.Wait()
 
-	conn, err := ln.Accept()
-	//ln.Close()
+	// 等待視訊串流連線
+	videoConn, err := ln.Accept()
 	if err != nil {
-		return nil, fmt.Errorf("accept: %w", err)
+		return nil, fmt.Errorf("accept video stream: %w", err)
 	}
 
-	return conn, nil
+	// 等待控制通道連線
+	controlConn, err := ln.Accept()
+	if err != nil {
+		videoConn.Close()
+		return nil, fmt.Errorf("accept control channel: %w", err)
+	}
+
+	return &ServerConn{
+		VideoStream: videoConn,
+		Control:     controlConn,
+	}, nil
 }
 
 // Forward 在本地建立與 scrcpy 通道的連線轉發

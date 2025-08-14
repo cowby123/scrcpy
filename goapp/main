@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -66,10 +67,15 @@ func signalHandler(w http.ResponseWriter, r *http.Request, peerConnection *webrt
 const serverJar = "./assets/scrcpy-server"
 
 func main() {
-
+	// 連線到第一台可用的裝置
 	dev, err := adb.NewDevice("")
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// 透過 adb reverse 將裝置連線轉回本機，便於伺服器傳送資料
+	if err := dev.Reverse("localabstract:scrcpy", "tcp:27183"); err != nil {
+		log.Fatal("reverse:", err)
 	}
 
 	// 將伺服器檔案推送至裝置暫存目錄
@@ -77,29 +83,71 @@ func main() {
 		log.Fatal("push server:", err)
 	}
 
-	// 啟動 scrcpy 伺服器（tunnel_forward=false）
-	stream, err := dev.StartServer()
+	// 啟動 scrcpy 伺服器並取得視訊串流和控制通道
+	conn, err := dev.StartServer()
 	if err != nil {
 		log.Fatal("start server:", err)
 	}
-	defer stream.Close()
+	defer conn.VideoStream.Close()
+	defer conn.Control.Close()
+
+	// 處理控制通道
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := conn.Control.Read(buf)
+			if err != nil {
+				log.Println("control channel read:", err)
+				break
+			}
+			// 這裡可以處理從 Android 設備接收到的控制命令
+			log.Printf("Received control message: %v\n", buf[:n])
+		}
+	}()
 
 	// WebRTC 部分
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
+			},
+		},
+	})
 	if err != nil {
 		log.Fatal("webrtc:", err)
 	}
+
+	// 增加連線狀態監控
+	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		log.Printf("Peer Connection State has changed: %s\n", s.String())
+	})
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			Channels:    0,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
 		"video", "scrcpy",
 	)
 	if err != nil {
 		log.Fatal("track:", err)
 	}
-	_, err = peerConnection.AddTrack(videoTrack)
+
+	sender, err := peerConnection.AddTrack(videoTrack)
 	if err != nil {
 		log.Fatal("add track:", err)
 	}
+
+	// 處理 RTCP 封包
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := sender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
 
 	// 啟動 WebSocket 信令伺服器
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -117,14 +165,52 @@ func main() {
 
 	// 讀取 scrcpy stream 並送到 WebRTC
 	go func() {
-		buf := make([]byte, 4096)
+		// 讀取封包頭的緩衝區
+		headerBuf := make([]byte, 12)
+
 		for {
-			n, err := stream.Read(buf)
+			// 讀取封包頭 (scrcpy 格式: PktLen(4) + PTS(8))
+			_, err := io.ReadFull(conn.VideoStream, headerBuf)
 			if err != nil {
-				log.Println("stream read:", err)
+				log.Println("read header:", err)
 				break
 			}
-			videoTrack.WriteSample(media.Sample{Data: buf[:n], Duration: time.Second / 30})
+
+			// 解析封包長度 (uint32 big-endian)
+			pktLen := uint32(headerBuf[0])<<24 | uint32(headerBuf[1])<<16 |
+				uint32(headerBuf[2])<<8 | uint32(headerBuf[3])
+
+			// 讀取視訊資料
+			frameBuf := make([]byte, pktLen)
+			_, err = io.ReadFull(conn.VideoStream, frameBuf)
+			if err != nil {
+				log.Println("read frame:", err)
+				break
+			}
+
+			// 檢查是否為關鍵幀 (H.264 NAL unit type = 5 或 7)
+			isKeyFrame := false
+			if len(frameBuf) > 4 {
+				nalType := frameBuf[4] & 0x1F
+				if nalType == 5 || nalType == 7 {
+					isKeyFrame = true
+				}
+			}
+
+			// 將資料推送到 WebRTC
+			if isKeyFrame {
+				// 關鍵幀需要包含 SPS/PPS
+				videoTrack.WriteSample(media.Sample{
+					Data:     frameBuf,
+					Duration: time.Second / 30,
+				})
+			} else {
+				// 一般幀直接發送
+				videoTrack.WriteSample(media.Sample{
+					Data:     frameBuf,
+					Duration: time.Second / 30,
+				})
+			}
 		}
 	}()
 
