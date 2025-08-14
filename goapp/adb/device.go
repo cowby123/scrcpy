@@ -73,7 +73,7 @@ func (d *Device) StartServer() (io.ReadWriteCloser, error) {
 	go cmd.Wait()
 
 	conn, err := ln.Accept()
-	ln.Close()
+	//ln.Close()
 	if err != nil {
 		return nil, fmt.Errorf("accept: %w", err)
 	}
