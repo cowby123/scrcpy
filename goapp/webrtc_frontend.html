@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>scrcpy WebRTC 前端</title>
+    <style>
+        body { background: #222; color: #eee; font-family: sans-serif; }
+        #remoteVideo { width: 100vw; height: 100vh; background: #000; }
+        #status { position: absolute; top: 10px; left: 10px; color: #fff; }
+    </style>
+</head>
+<body>
+    <div id="status">連線狀態：<span id="stat">初始化</span></div>
+    <video id="remoteVideo" autoplay playsinline controls></video>
+    <script>
+    const ws = new WebSocket("ws://" + location.hostname + ":8080/ws");
+    const pc = new RTCPeerConnection();
+    const status = document.getElementById("stat");
+    ws.onopen = () => status.textContent = "WebSocket 已連線";
+    ws.onerror = () => status.textContent = "WebSocket 錯誤";
+    ws.onclose = () => status.textContent = "WebSocket 已關閉";
+
+    ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.sdp) {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            status.textContent = "收到 SDP: " + msg.sdp.type;
+            if (msg.sdp.type === "offer") {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                ws.send(JSON.stringify({sdp: pc.localDescription}));
+            }
+        }
+        if (msg.candidate) {
+            await pc.addIceCandidate(msg.candidate);
+            status.textContent = "收到 ICE 候選";
+        }
+    };
+
+    pc.onicecandidate = (event) => {
+        if (event.candidate) {
+            ws.send(JSON.stringify({candidate: event.candidate}));
+        }
+    };
+
+    pc.ontrack = (event) => {
+        document.getElementById("remoteVideo").srcObject = event.streams[0];
+        status.textContent = "已取得視訊串流";
+    };
+    </script>
+</body>
+</html>
