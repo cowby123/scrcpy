@@ -2,6 +2,8 @@
 package main
 
 import (
+	"encoding/binary"
+	"io"
 	"log"
 	"os"
 	"time"
@@ -46,19 +48,25 @@ func main() {
 	// 讀取視訊串流並保存
 	frameCount := 0
 	startTime := time.Now()
+	header := make([]byte, 12) // scrcpy: [size(4)] + [pts(8)]
 
 	for {
-		// 直接讀取並寫入所有收到的資料
-		buffer := make([]byte, 4096)
-		n, err := conn.VideoStream.Read(buffer)
-		if err != nil {
-			log.Println("read error:", err)
+		// 讀取封包頭
+		if _, err := io.ReadFull(conn.VideoStream, header); err != nil {
+			log.Println("read header:", err)
+			break
+		}
+		frameSize := binary.BigEndian.Uint32(header[:4])
+
+		// 依照封包長度讀取完整影格
+		frame := make([]byte, frameSize)
+		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
+			log.Println("read frame:", err)
 			break
 		}
 
-		// 直接寫入檔案
-		_, err = outFile.Write(buffer[:n])
-		if err != nil {
+		// 寫入影格資料，不包含 scrcpy 封包頭
+		if _, err := outFile.Write(frame); err != nil {
 			log.Println("write error:", err)
 			break
 		}
@@ -67,9 +75,9 @@ func main() {
 		frameCount++
 		if frameCount%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
-			bytesPerSecond := float64(frameCount*4096) / elapsed
-			log.Printf("接收資料量: %.2f MB, 速率: %.2f MB/s\n",
-				float64(frameCount*4096)/(1024*1024),
+			bytesPerSecond := (float64(frameCount) * float64(frameSize)) / elapsed
+			log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
+				frameCount,
 				bytesPerSecond/(1024*1024))
 		}
 	}
