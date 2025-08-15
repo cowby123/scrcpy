@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"log"
@@ -44,6 +45,14 @@ func main() {
 	defer outFile.Close()
 
 	log.Println("開始接收視訊串流，儲存至 output.h264")
+
+	// 讀取並略過裝置名稱封包 (64 bytes)
+	nameBuf := make([]byte, 64)
+	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
+		log.Fatal("read device name:", err)
+	}
+	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
+	log.Printf("裝置名稱: %s\n", deviceName)
 
 	// 讀取視訊串流並保存
 	frameCount := 0
