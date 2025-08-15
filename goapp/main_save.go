@@ -54,18 +54,29 @@ func main() {
 	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
 	log.Printf("裝置名稱: %s\n", deviceName)
 
+	// 讀取視訊編碼格式與解析度資訊 (12 bytes)
+	vHeader := make([]byte, 12)
+	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
+		log.Fatal("read video header:", err)
+	}
+	codec := string(vHeader[:4])
+	width := binary.BigEndian.Uint32(vHeader[4:8])
+	height := binary.BigEndian.Uint32(vHeader[8:12])
+	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, width, height)
+
 	// 讀取視訊串流並保存
 	frameCount := 0
+	totalBytes := int64(0)
 	startTime := time.Now()
-	header := make([]byte, 12) // scrcpy: [size(4)] + [pts(8)]
+	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
 
 	for {
-		// 讀取封包頭
-		if _, err := io.ReadFull(conn.VideoStream, header); err != nil {
-			log.Println("read header:", err)
+		// 讀取影格中繼資料
+		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
+			log.Println("read frame meta:", err)
 			break
 		}
-		frameSize := binary.BigEndian.Uint32(header[:4])
+		frameSize := binary.BigEndian.Uint32(meta[8:12])
 
 		// 依照封包長度讀取完整影格
 		frame := make([]byte, frameSize)
@@ -74,17 +85,17 @@ func main() {
 			break
 		}
 
-		// 寫入影格資料，不包含 scrcpy 封包頭
+		// 寫入影格資料
 		if _, err := outFile.Write(frame); err != nil {
 			log.Println("write error:", err)
 			break
 		}
 
-		// 定期顯示已接收的資料量
 		frameCount++
+		totalBytes += int64(frameSize)
 		if frameCount%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
-			bytesPerSecond := (float64(frameCount) * float64(frameSize)) / elapsed
+			bytesPerSecond := float64(totalBytes) / elapsed
 			log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
 				frameCount,
 				bytesPerSecond/(1024*1024))
