@@ -2,6 +2,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"io"
 	"log"
 	"os"
 	"time"
@@ -43,33 +46,58 @@ func main() {
 
 	log.Println("開始接收視訊串流，儲存至 output.h264")
 
+	// 讀取並略過裝置名稱封包 (64 bytes)
+	nameBuf := make([]byte, 64)
+	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
+		log.Fatal("read device name:", err)
+	}
+	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
+	log.Printf("裝置名稱: %s\n", deviceName)
+
+	// 讀取視訊編碼格式與解析度資訊 (12 bytes)
+	vHeader := make([]byte, 12)
+	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
+		log.Fatal("read video header:", err)
+	}
+	codec := string(vHeader[:4])
+	width := binary.BigEndian.Uint32(vHeader[4:8])
+	height := binary.BigEndian.Uint32(vHeader[8:12])
+	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, width, height)
+
 	// 讀取視訊串流並保存
 	frameCount := 0
+	totalBytes := int64(0)
 	startTime := time.Now()
+	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
 
 	for {
-		// 直接讀取並寫入所有收到的資料
-		buffer := make([]byte, 4096)
-		n, err := conn.VideoStream.Read(buffer)
-		if err != nil {
-			log.Println("read error:", err)
+		// 讀取影格中繼資料
+		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
+			log.Println("read frame meta:", err)
+			break
+		}
+		frameSize := binary.BigEndian.Uint32(meta[8:12])
+
+		// 依照封包長度讀取完整影格
+		frame := make([]byte, frameSize)
+		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
+			log.Println("read frame:", err)
 			break
 		}
 
-		// 直接寫入檔案
-		_, err = outFile.Write(buffer[:n])
-		if err != nil {
+		// 寫入影格資料
+		if _, err := outFile.Write(frame); err != nil {
 			log.Println("write error:", err)
 			break
 		}
 
-		// 定期顯示已接收的資料量
 		frameCount++
+		totalBytes += int64(frameSize)
 		if frameCount%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
-			bytesPerSecond := float64(frameCount*4096) / elapsed
-			log.Printf("接收資料量: %.2f MB, 速率: %.2f MB/s\n",
-				float64(frameCount*4096)/(1024*1024),
+			bytesPerSecond := float64(totalBytes) / elapsed
+			log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
+				frameCount,
 				bytesPerSecond/(1024*1024))
 		}
 	}
