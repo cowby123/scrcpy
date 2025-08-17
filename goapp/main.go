@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"io"
 	"log"
-	"os"
 	"time"
 
 	"github.com/yourname/scrcpy-go/adb"
@@ -37,14 +36,7 @@ func main() {
 	defer conn.VideoStream.Close()
 	defer conn.Control.Close()
 
-	// 建立輸出檔案
-	outFile, err := os.Create("output.h264")
-	if err != nil {
-		log.Fatal("create output file:", err)
-	}
-	defer outFile.Close()
-
-	log.Println("開始接收視訊串流，儲存至 output.h264")
+	log.Println("開始接收視訊串流，透過瀏覽器播放")
 
 	// 讀取並略過裝置名稱封包 (64 bytes)
 	nameBuf := make([]byte, 64)
@@ -85,10 +77,11 @@ func main() {
 			break
 		}
 
-		// 寫入影格資料
-		if _, err := outFile.Write(frame); err != nil {
-			log.Println("write error:", err)
-			break
+		// 將影格推送到 WebRTC 連線
+		select {
+		case videoCh <- frame:
+		default:
+			// 若沒有接收者或通道已滿，略過此影格
 		}
 
 		frameCount++
