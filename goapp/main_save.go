@@ -1,28 +1,40 @@
-// 這是一個以 Go 撰寫的簡易 scrcpy 客戶端範例，用於保存視訊串流
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/yourname/scrcpy-go/adb"
 )
 
 var (
 	upgrader    = websocket.Upgrader{}
 	tracksMu    sync.Mutex
 	videoTracks []*webrtc.TrackLocalStaticSample
+	whiteFrame  []byte
 )
+
+func init() {
+	whiteFrame = []byte{
+		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x0C, 0x8D, 0x8D, 0x40, 0x50, 0x1E, 0xD0, 0x0B, 0x80, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xF1, 0x83, 0x19, 0x60,
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x06, 0xE2,
+		0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00,
+	}
+	for i := 0; i < 256; i++ {
+		whiteFrame = append(whiteFrame, 0xFF)
+	}
+	for i := 0; i < 64; i++ {
+		whiteFrame = append(whiteFrame, 0x80)
+	}
+	for i := 0; i < 64; i++ {
+		whiteFrame = append(whiteFrame, 0x80)
+	}
+}
 
 // signalHandler 提供簡易的 WebRTC 信令處理，透過 WebSocket 與瀏覽器交換 SDP/ICE。
 // 每次瀏覽器連線都建立新的 PeerConnection 與 Track，避免重整後狀態不一致。
@@ -53,7 +65,6 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 		webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			Channels:    0,
 			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
 		},
 		"video", "scrcpy",
@@ -129,58 +140,6 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// 連線到第一台可用的裝置
-	dev, err := adb.NewDevice("")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// 透過 adb reverse 將裝置連線轉回本機，便於伺服器傳送資料
-	if err := dev.Reverse("localabstract:scrcpy", "tcp:27183"); err != nil {
-		log.Fatal("reverse:", err)
-	}
-
-	// 將伺服器檔案推送至裝置暫存目錄
-	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
-		log.Fatal("push server:", err)
-	}
-
-	// 啟動 scrcpy 伺服器並取得視訊串流
-	conn, err := dev.StartServer()
-	if err != nil {
-		log.Fatal("start server:", err)
-	}
-	defer conn.VideoStream.Close()
-	defer conn.Control.Close()
-
-	// 建立輸出檔案
-	outFile, err := os.Create("output.h264")
-	if err != nil {
-		log.Fatal("create output file:", err)
-	}
-	defer outFile.Close()
-
-	log.Println("開始接收視訊串流，儲存至 output.h264")
-
-	// 讀取並略過裝置名稱封包 (64 bytes)
-	nameBuf := make([]byte, 64)
-	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
-		log.Fatal("read device name:", err)
-	}
-	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
-	log.Printf("裝置名稱: %s\n", deviceName)
-
-	// 讀取視訊編碼格式與解析度資訊 (12 bytes)
-	vHeader := make([]byte, 12)
-	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
-		log.Fatal("read video header:", err)
-	}
-	codec := string(vHeader[:4])
-	width := binary.BigEndian.Uint32(vHeader[4:8])
-	height := binary.BigEndian.Uint32(vHeader[8:12])
-	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, width, height)
-
-	// 啟動 WebSocket 信令伺服器與靜態檔案伺服器
 	http.HandleFunc("/ws", signalHandler)
 	fs := http.FileServer(http.Dir("."))
 	http.Handle("/", fs)
@@ -191,51 +150,14 @@ func main() {
 		}
 	}()
 
-        // 讀取視訊串流並保存，同時推送到所有 WebRTC 連線（另起 goroutine）
-        go func() {
-                frameCount := 0
-                totalBytes := int64(0)
-                startTime := time.Now()
-                meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
-
-                for {
-                        if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
-                                log.Println("read frame meta:", err)
-                                break
-                        }
-                        frameSize := binary.BigEndian.Uint32(meta[8:12])
-
-                        frame := make([]byte, frameSize)
-                        if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
-                                log.Println("read frame:", err)
-                                break
-                        }
-
-                        if _, err := outFile.Write(frame); err != nil {
-                                log.Println("write error:", err)
-                                break
-                        }
-
-                        // 將影格推送給所有目前的 WebRTC 連線
-                        tracksMu.Lock()
-                        for _, t := range videoTracks {
-                                if err := t.WriteSample(media.Sample{Data: frame, Duration: time.Second / 30}); err != nil {
-                                        log.Println("write sample:", err)
-                                }
-                        }
-                        tracksMu.Unlock()
-
-                        frameCount++
-                        totalBytes += int64(frameSize)
-                        if frameCount%100 == 0 {
-                                elapsed := time.Since(startTime).Seconds()
-                                bytesPerSecond := float64(totalBytes) / elapsed
-                                log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
-                                        frameCount,
-                                        bytesPerSecond/(1024*1024))
-                        }
-                }
-        }()
-
-	select {} // 保持程式執行
+	ticker := time.NewTicker(time.Second / 30)
+	for range ticker.C {
+		tracksMu.Lock()
+		for _, t := range videoTracks {
+			if err := t.WriteSample(media.Sample{Data: whiteFrame, Duration: time.Second / 30}); err != nil {
+				log.Println("write sample:", err)
+			}
+		}
+		tracksMu.Unlock()
+	}
 }
