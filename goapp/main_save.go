@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,51 +18,112 @@ import (
 	"github.com/yourname/scrcpy-go/adb"
 )
 
-var upgrader = websocket.Upgrader{}
+var (
+	upgrader    = websocket.Upgrader{}
+	tracksMu    sync.Mutex
+	videoTracks []*webrtc.TrackLocalStaticSample
+)
 
-// signalHandler 提供簡易的 WebRTC 信令處理，透過 WebSocket 與瀏覽器交換 SDP/ICE
-func signalHandler(w http.ResponseWriter, r *http.Request, peerConnection *webrtc.PeerConnection) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+// signalHandler 提供簡易的 WebRTC 信令處理，透過 WebSocket 與瀏覽器交換 SDP/ICE。
+// 每次瀏覽器連線都建立新的 PeerConnection 與 Track，避免重整後狀態不一致。
+func signalHandler(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("upgrade:", err)
 		return
 	}
-	defer conn.Close()
+	defer ws.Close()
 
-	peerConnection.OnICECandidate(func(c *webrtc.ICECandidate) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
+	})
+	if err != nil {
+		log.Println("webrtc:", err)
+		return
+	}
+	defer pc.Close()
+
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		log.Printf("Peer Connection State has changed: %s\n", s.String())
+	})
+
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeH264,
+			ClockRate:   90000,
+			Channels:    0,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		},
+		"video", "scrcpy",
+	)
+	if err != nil {
+		log.Println("track:", err)
+		return
+	}
+	sender, err := pc.AddTrack(videoTrack)
+	if err != nil {
+		log.Println("add track:", err)
+		return
+	}
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, err := sender.Read(rtcpBuf); err != nil {
+				return
+			}
+		}
+	}()
+
+	tracksMu.Lock()
+	videoTracks = append(videoTracks, videoTrack)
+	tracksMu.Unlock()
+	defer func() {
+		tracksMu.Lock()
+		for i, t := range videoTracks {
+			if t == videoTrack {
+				videoTracks = append(videoTracks[:i], videoTracks[i+1:]...)
+				break
+			}
+		}
+		tracksMu.Unlock()
+	}()
+
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
 		cand, _ := json.Marshal(c.ToJSON())
-		conn.WriteJSON(map[string]interface{}{"candidate": json.RawMessage(cand)})
+		ws.WriteJSON(map[string]interface{}{"candidate": json.RawMessage(cand)})
 	})
 
-	offer, err := peerConnection.CreateOffer(nil)
+	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		log.Println("offer:", err)
 		return
 	}
-	if err = peerConnection.SetLocalDescription(offer); err != nil {
+	if err = pc.SetLocalDescription(offer); err != nil {
 		log.Println("set local desc:", err)
 		return
 	}
-	conn.WriteJSON(map[string]interface{}{"sdp": offer})
+	ws.WriteJSON(map[string]interface{}{"sdp": offer})
 
 	for {
 		var msg map[string]json.RawMessage
-		if err := conn.ReadJSON(&msg); err != nil {
+		if err := ws.ReadJSON(&msg); err != nil {
 			log.Println("ws read:", err)
 			break
 		}
 		if sdp, ok := msg["sdp"]; ok {
 			var desc webrtc.SessionDescription
 			json.Unmarshal(sdp, &desc)
-			peerConnection.SetRemoteDescription(desc)
+			pc.SetRemoteDescription(desc)
 		}
 		if cand, ok := msg["candidate"]; ok {
 			var ice webrtc.ICECandidateInit
 			json.Unmarshal(cand, &ice)
-			peerConnection.AddICECandidate(ice)
+			pc.AddICECandidate(ice)
 		}
 	}
 }
@@ -118,47 +180,8 @@ func main() {
 	height := binary.BigEndian.Uint32(vHeader[8:12])
 	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, width, height)
 
-	// 設定 WebRTC，並透過 HTTP+WebSocket 提供信令
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	})
-	if err != nil {
-		log.Fatal("webrtc:", err)
-	}
-	peerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("Peer Connection State has changed: %s\n", s.String())
-	})
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			Channels:    0,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		"video", "scrcpy",
-	)
-	if err != nil {
-		log.Fatal("track:", err)
-	}
-	sender, err := peerConnection.AddTrack(videoTrack)
-	if err != nil {
-		log.Fatal("add track:", err)
-	}
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, err := sender.Read(rtcpBuf); err != nil {
-				return
-			}
-		}
-	}()
-
 	// 啟動 WebSocket 信令伺服器與靜態檔案伺服器
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		signalHandler(w, r, peerConnection)
-	})
+	http.HandleFunc("/ws", signalHandler)
 	fs := http.FileServer(http.Dir("."))
 	http.Handle("/", fs)
 	go func() {
@@ -168,13 +191,17 @@ func main() {
 		}
 	}()
 
-	// 推送假畫面到 WebRTC，暫以固定位元串做測試
+	// 推送假畫面到所有 WebRTC 連線，暫以固定位元串做測試
 	fakeFrame := []byte{0x00, 0x00, 0x00, 0x01, 0x09, 0xf0}
 	go func() {
 		ticker := time.NewTicker(time.Second / 30)
 		defer ticker.Stop()
 		for range ticker.C {
-			videoTrack.WriteSample(media.Sample{Data: fakeFrame, Duration: time.Second / 30})
+			tracksMu.Lock()
+			for _, t := range videoTracks {
+				t.WriteSample(media.Sample{Data: fakeFrame, Duration: time.Second / 30})
+			}
+			tracksMu.Unlock()
 		}
 	}()
 
