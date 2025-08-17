@@ -44,7 +44,7 @@
             if (msg.sdp.sdp) {
                 msg.sdp.sdp = msg.sdp.sdp.replace(
                     /(a=fmtp:(\d+))(?=\r\n)/g,
-                    '$1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f'
+                    '$1;level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c00c'
                 );
                 console.log('Modified SDP:', msg.sdp.sdp);
             }

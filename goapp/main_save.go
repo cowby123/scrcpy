@@ -62,11 +62,11 @@ func signalHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
+               webrtc.RTPCodecCapability{
+                       MimeType:    webrtc.MimeTypeH264,
+                       ClockRate:   90000,
+                       SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c00c",
+               },
 		"video", "scrcpy",
 	)
 	if err != nil {
