@@ -69,6 +69,7 @@ func main() {
 	totalBytes := int64(0)
 	startTime := time.Now()
 	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
+	var prevPTS uint64
 	go RunRTC()
 	for {
 		// 讀取影格中繼資料
@@ -76,6 +77,7 @@ func main() {
 			log.Println("read frame meta:", err)
 			break
 		}
+		pts := binary.BigEndian.Uint64(meta[:8])
 		frameSize := binary.BigEndian.Uint32(meta[8:12])
 
 		// 依照封包長度讀取完整影格
@@ -90,6 +92,13 @@ func main() {
 			log.Println("write error:", err)
 			break
 		}
+
+		duration := time.Second / 30
+		if prevPTS != 0 && pts > prevPTS {
+			duration = time.Duration(pts-prevPTS) * time.Microsecond
+		}
+		prevPTS = pts
+		frameCh <- Frame{Data: frame, Duration: duration}
 
 		frameCount++
 		totalBytes += int64(frameSize)
