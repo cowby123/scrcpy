@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+        "fmt"
 	"io"
 	"log"
 	"os"
@@ -108,6 +109,7 @@ func main() {
 		if isConfig {
 			// store SPS/PPS to prepend to next keyframe
 			conf = append(conf[:0], annexb...)
+                        setProfileLevelID(extractProfileLevelID(annexb))
 			continue
 		}
 		if isKey && len(conf) > 0 {
@@ -152,4 +154,28 @@ func avccToAnnexB(data []byte) []byte {
 		data = data[n:]
 	}
 	return out
+}
+
+// extractProfileLevelID returns profile-level-id from SPS NAL in Annex-B data.
+func extractProfileLevelID(conf []byte) string {
+        const def = "42e01f"
+        start := []byte{0x00, 0x00, 0x00, 0x01}
+        for i := 0; i+4 < len(conf); {
+                if bytes.Equal(conf[i:i+4], start) {
+                        i += 4
+                        if i >= len(conf) {
+                                break
+                        }
+                        nalType := conf[i] & 0x1F
+                        if nalType == 7 && i+4 <= len(conf) {
+                                return fmt.Sprintf("%02x%02x%02x", conf[i+1], conf[i+2], conf[i+3])
+                        }
+                        for i+4 < len(conf) && !bytes.Equal(conf[i:i+4], start) {
+                                i++
+                        }
+                } else {
+                        i++
+                }
+        }
+        return def
 }

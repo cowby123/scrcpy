@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+        "fmt"
 	"log"
 	"net/http"
+        "sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -21,7 +23,24 @@ type Frame struct {
 	Duration time.Duration
 }
 
-var frameCh = make(chan Frame, 128)
+var (
+        frameCh = make(chan Frame, 128)
+        profileMu sync.RWMutex
+        profileLevelID = "42e01f"
+)
+func getProfileLevelID() string {
+        profileMu.RLock()
+        id := profileLevelID
+        profileMu.RUnlock()
+        return id
+}
+
+func setProfileLevelID(id string) {
+        profileMu.Lock()
+        profileLevelID = id
+        profileMu.Unlock()
+}
+
 
 func RunRTC() {
 	http.Handle("/", http.FileServer(http.Dir("./web")))
@@ -73,7 +92,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			SDPFmtpLine: fmt.Sprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", getProfileLevelID()),
 		},
 		"video", "pion",
 	)
