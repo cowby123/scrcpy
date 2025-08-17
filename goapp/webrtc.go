@@ -2,28 +2,46 @@ package main
 
 import (
 	"encoding/json"
-	"io"
+	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"os/exec"
-	"strconv"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 )
 
 // 可調整的參數
+// 可調整的參數
 var (
-	listenAddr  = ":8888" // HTTP 監聽埠
-	videoWidth  = "1280"
-	videoHeight = "720"
-	videoFPS    = "30"     // 例如 "30"
-	ffmpegPath  = "ffmpeg" // 若不在 PATH 請改絕對路徑
-	ffmpegColor = "white"  // 支援 ffmpeg color 名稱或 #RRGGBB
+	listenAddr = ":8888" // HTTP 監聽埠
 )
+
+type Frame struct {
+	Data     []byte
+	Duration time.Duration
+	Key      bool
+}
+
+var (
+	frameCh        = make(chan Frame, 128)
+	profileMu      sync.RWMutex
+	profileLevelID = "42e01f"
+)
+
+func getProfileLevelID() string {
+	profileMu.RLock()
+	id := profileLevelID
+	profileMu.RUnlock()
+	return id
+}
+
+func setProfileLevelID(id string) {
+	profileMu.Lock()
+	profileLevelID = id
+	profileMu.Unlock()
+}
 
 func RunRTC() {
 	http.Handle("/", http.FileServer(http.Dir("./web")))
@@ -75,7 +93,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+			SDPFmtpLine: fmt.Sprintf("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=%s", getProfileLevelID()),
 		},
 		"video", "pion",
 	)
@@ -110,114 +128,22 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherComplete
 
-	// 5) ffmpeg 產生 H.264 (Annex-B) 串流 → 以 h264reader 解析 → 聚合 AU 後寫入 Track
+	// 5) 從 frameCh 讀取 H.264 影格並寫入 Track
 	go func() {
-		fps := 30
-		if v, err := strconv.Atoi(videoFPS); err == nil && v > 0 && v <= 240 {
-			fps = v
-		}
-		frameDuration := time.Second / time.Duration(fps)
-
-		args := []string{
-			"-hide_banner", "-loglevel", "error",
-			"-f", "lavfi", "-i", "color=c=" + ffmpegColor + ":s=" + videoWidth + "x" + videoHeight + ":r=" + videoFPS,
-			"-vcodec", "libx264",
-			"-pix_fmt", "yuv420p",
-			"-tune", "zerolatency",
-			"-preset", "veryfast",
-			"-profile:v", "baseline",
-			"-level", "3.1",
-			"-x264-params", "repeat-headers=1:scenecut=0:open_gop=0:keyint=" + videoFPS + ":min-keyint=" + videoFPS,
-			"-an",
-			"-f", "h264", "pipe:1",
-		}
-		cmd := exec.Command(ffmpegPath, args...)
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Println("ffmpeg stdout:", err)
-			return
-		}
-		cmd.Stderr = os.Stderr
-		if err = cmd.Start(); err != nil {
-			log.Println("ffmpeg start:", err)
-			return
-		}
-		defer func() { _ = cmd.Process.Kill() }()
-
-		// 當連線結束時，結束 ffmpeg 讓讀取 goroutine 收到 EOF
-		go func() { <-closed; _ = cmd.Process.Kill() }()
-
-		r, err := h264reader.NewReader(stdout)
-		if err != nil {
-			log.Println("h264 reader:", err)
-			return
-		}
-
-		naluCh := make(chan *h264reader.NAL, 128)
-		errCh := make(chan error, 1)
-
-		go func() {
-			defer close(naluCh)
-			for {
-				n, err := r.NextNAL()
-				if err != nil {
-					errCh <- err
-					return
-				}
-				naluCh <- n
-			}
-		}()
-
-		ticker := time.NewTicker(frameDuration)
-		defer ticker.Stop()
-
-		var (
-			curFrame  []byte
-			haveSlice bool
-			startCode = []byte{0x00, 0x00, 0x00, 0x01}
-			flush     = func() {
-				if len(curFrame) == 0 {
-					return
-				}
-				if err := videoTrack.WriteSample(media.Sample{Data: curFrame, Duration: frameDuration}); err != nil {
-					log.Println("write sample:", err)
-				}
-				curFrame = curFrame[:0]
-				haveSlice = false
-			}
-		)
-
+		seenKey := false
 		for {
 			select {
 			case <-closed:
 				return
-			case <-ticker.C:
-				if haveSlice {
-					flush()
-				}
-			case err := <-errCh:
-				if err == io.EOF {
-					return
-				}
-				log.Println("h264 read:", err)
-				return
-			case nalu, ok := <-naluCh:
-				if !ok {
-					return
-				}
-				if nalu == nil {
-					continue
-				}
-				curFrame = append(curFrame, startCode...)
-				curFrame = append(curFrame, nalu.Data...)
-
-				switch nalu.UnitType {
-				case h264reader.NalUnitTypeCodedSliceIdr, h264reader.NalUnitTypeCodedSliceNonIdr:
-					haveSlice = true
-				case h264reader.NalUnitTypeAUD:
-					if haveSlice {
-						flush()
+			case f := <-frameCh:
+				if !seenKey {
+					if !f.Key {
+						continue
 					}
+					seenKey = true
+				}
+				if err := videoTrack.WriteSample(media.Sample{Data: f.Data, Duration: f.Duration}); err != nil {
+					log.Println("write sample:", err)
 				}
 			}
 		}

@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -68,7 +69,15 @@ func main() {
 	frameCount := 0
 	totalBytes := int64(0)
 	startTime := time.Now()
-	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
+	const (
+		flagConfig   = uint64(1) << 63
+		flagKeyFrame = uint64(1) << 62
+	)
+	meta := make([]byte, 12) // scrcpy: [pts+flags(8)] + [size(4)]
+	var (
+		prevPTS uint64
+		conf    []byte
+	)
 	go RunRTC()
 	for {
 		// 讀取影格中繼資料
@@ -76,6 +85,7 @@ func main() {
 			log.Println("read frame meta:", err)
 			break
 		}
+		ptsAndFlags := binary.BigEndian.Uint64(meta[:8])
 		frameSize := binary.BigEndian.Uint32(meta[8:12])
 
 		// 依照封包長度讀取完整影格
@@ -91,6 +101,28 @@ func main() {
 			break
 		}
 
+		isConfig := ptsAndFlags&flagConfig != 0
+		isKey := ptsAndFlags&flagKeyFrame != 0
+		pts := ptsAndFlags &^ (flagConfig | flagKeyFrame)
+
+		annexb := avccToAnnexB(frame)
+		if isConfig {
+			// store SPS/PPS to prepend to next keyframe
+			conf = append(conf[:0], annexb...)
+			setProfileLevelID(extractProfileLevelID(annexb))
+			continue
+		}
+		if isKey && len(conf) > 0 {
+			annexb = append(conf, annexb...)
+		}
+
+		duration := time.Second / 30
+		if prevPTS != 0 && pts > prevPTS {
+			duration = time.Duration(pts-prevPTS) * time.Microsecond
+		}
+		prevPTS = pts
+		frameCh <- Frame{Data: annexb, Duration: duration, Key: isKey}
+
 		frameCount++
 		totalBytes += int64(frameSize)
 		if frameCount%100 == 0 {
@@ -101,4 +133,49 @@ func main() {
 				bytesPerSecond/(1024*1024))
 		}
 	}
+}
+
+// avccToAnnexB converts H.264 NAL units from AVCC (length-prefixed) to Annex-B.
+// If the data already contains Annex-B start codes, it is returned unchanged.
+func avccToAnnexB(data []byte) []byte {
+	if bytes.HasPrefix(data, []byte{0x00, 0x00, 0x00, 0x01}) ||
+		bytes.HasPrefix(data, []byte{0x00, 0x00, 0x01}) {
+		return data
+	}
+	out := make([]byte, 0, len(data)+len(data)/4*4)
+	for len(data) >= 4 {
+		n := int(binary.BigEndian.Uint32(data[:4]))
+		data = data[4:]
+		if n <= 0 || len(data) < n {
+			break
+		}
+		out = append(out, 0x00, 0x00, 0x00, 0x01)
+		out = append(out, data[:n]...)
+		data = data[n:]
+	}
+	return out
+}
+
+// extractProfileLevelID returns profile-level-id from SPS NAL in Annex-B data.
+func extractProfileLevelID(conf []byte) string {
+	const def = "42e01f"
+	start := []byte{0x00, 0x00, 0x00, 0x01}
+	for i := 0; i+4 < len(conf); {
+		if bytes.Equal(conf[i:i+4], start) {
+			i += 4
+			if i >= len(conf) {
+				break
+			}
+			nalType := conf[i] & 0x1F
+			if nalType == 7 && i+4 <= len(conf) {
+				return fmt.Sprintf("%02x%02x%02x", conf[i+1], conf[i+2], conf[i+3])
+			}
+			for i+4 < len(conf) && !bytes.Equal(conf[i:i+4], start) {
+				i++
+			}
+		} else {
+			i++
+		}
+	}
+	return def
 }
