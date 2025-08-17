@@ -1,51 +1,141 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WebRTC 白畫面 PoC (H.264)</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>scrcpy WebRTC Demo</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Noto Sans TC, sans-serif; margin: 24px; }
-    video { width: 100%; max-width: 960px; background: #000; }
-    .row { margin: 12px 0; }
-    label { display: block; margin-bottom: 6px; }
+    :root { color-scheme: dark; }
+    body { margin:0; background:#111; display:flex; gap:16px; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; font-family:ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial; }
+    header { color:#ddd; opacity:.9; }
+    video { width:min(92vw, 900px); max-height:80vh; background:black; border-radius:12px; box-shadow:0 6px 30px rgba(0,0,0,.35); }
+    .row { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
+    button { padding:10px 16px; border-radius:10px; border:1px solid #333; background:#1f1f1f; color:#ddd; cursor:pointer; }
+    button:hover { background:#262626; }
+    pre { width:min(92vw, 900px); max-height:22vh; overflow:auto; background:#0c0c0c; color:#bbb; border:1px solid #222; border-radius:10px; padding:10px; }
   </style>
 </head>
 <body>
-  <h1>WebRTC 白畫面 PoC (H.264)</h1>
-  <div class="row"><button id="start">Start</button></div>
-  <video id="v" autoplay playsinline controls muted></video>
+  <header>
+    <h2>scrcpy WebRTC Demo</h2>
+  </header>
+
+  <video id="video" autoplay playsinline controls muted></video>
+
+  <div class="row">
+    <button id="btnStart">開始連線</button>
+    <button id="btnStop" disabled>中斷連線</button>
+  </div>
+
+  <pre id="log" aria-label="log"></pre>
 
   <script>
-  const start = document.getElementById('start');
-  const video = document.getElementById('v');
-
-  start.onclick = async () => {
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
-    });
-    pc.addTransceiver('video', { direction: 'recvonly' });
-    pc.ontrack = (ev) => {
-      if (ev.streams && ev.streams[0]) {
-        video.srcObject = ev.streams[0];
-      } else {
-        const ms = new MediaStream();
-        ms.addTrack(ev.track);
-        video.srcObject = ms;
-      }
+    const $ = (s)=>document.querySelector(s);
+    const log = (...args) => {
+      const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+      $("#log").textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+      $("#log").scrollTop = $("#log").scrollHeight;
+      console.log(...args);
     };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
 
-    const res = await fetch('/offer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(pc.localDescription)
-    });
-    const answer = await res.json();
-    await pc.setRemoteDescription(answer);
-    start.disabled = true;
-  };
+    let pc;
+
+    function waitForIceComplete(pc) {
+      return new Promise(resolve => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        function check() {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", check);
+            resolve();
+          }
+        }
+        pc.addEventListener("icegatheringstatechange", check);
+      });
+    }
+
+    async function start() {
+      try {
+        $("#btnStart").disabled = true;
+        $("#btnStop").disabled = false;
+
+        pc = new RTCPeerConnection();
+
+        // 顯示遠端影像
+        const videoEl = $("#video");
+        pc.ontrack = (e) => {
+          if (!videoEl.srcObject) {
+            videoEl.srcObject = e.streams[0];
+          }
+        };
+
+        // 收視訊（recvonly），並優先 H.264
+        const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+        const caps = RTCRtpReceiver.getCapabilities("video");
+        if (caps && caps.codecs) {
+          const h264 = caps.codecs.filter(c => (c.mimeType || c.mimeTypeCanonical || '').toLowerCase() === "video/h264");
+          if (h264.length) {
+            transceiver.setCodecPreferences(h264);
+            log("使用 H.264 codec 偏好。");
+          } else {
+            log("找不到 H.264 能力，瀏覽器可能不支援。");
+          }
+        }
+
+        // 事件監控
+        pc.onconnectionstatechange = () => log("PeerConnection:", pc.connectionState);
+        pc.oniceconnectionstatechange = () => log("ICE:", pc.iceConnectionState);
+        pc.onicegatheringstatechange = () => log("ICE Gathering:", pc.iceGatheringState);
+        pc.onicecandidateerror = (e) => log("ICE Candidate Error:", e.errorText || e);
+
+        // 產生 Offer 並等待 ICE 完成（與後端 non-trickle 對齊）
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitForIceComplete(pc);
+
+        // 傳送給 Go backend
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(pc.localDescription),
+        });
+        if (!resp.ok) throw new Error(`Offer 送出失敗: ${resp.status} ${resp.statusText}`);
+        const answer = await resp.json();
+
+        await pc.setRemoteDescription(answer);
+        log("WebRTC 已連線，等待畫面…");
+      } catch (err) {
+        log("連線發生錯誤：", err);
+        $("#btnStart").disabled = false;
+        $("#btnStop").disabled = true;
+      }
+    }
+
+    async function stop() {
+      try {
+        $("#btnStop").disabled = true;
+        if (pc) {
+          pc.getTransceivers().forEach(t => t.stop && t.stop());
+          pc.getSenders().forEach(s => s.track && s.track.stop());
+          pc.getReceivers().forEach(r => r.track && r.track.stop());
+          pc.close();
+          pc = null;
+        }
+        const videoEl = $("#video");
+        if (videoEl.srcObject) {
+          videoEl.srcObject.getTracks().forEach(t => t.stop());
+          videoEl.srcObject = null;
+        }
+        log("已中斷連線。");
+      } finally {
+        $("#btnStart").disabled = false;
+      }
+    }
+
+    $("#btnStart").addEventListener("click", start);
+    $("#btnStop").addEventListener("click", stop);
+
+    // 自動嘗試連線（可手動改成只按鈕觸發）
+    start();
   </script>
 </body>
 </html>
