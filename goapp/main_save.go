@@ -191,69 +191,51 @@ func main() {
 		}
 	}()
 
-        // 推送假畫面到所有 WebRTC 連線，使用一個包含 SPS/PPS/IDR 的
-        // 基本 H264 Access Unit（黑色影格），以確保瀏覽器能成功解碼
-        // 並顯示畫面
-        fakeFrame := []byte{
-                // SPS
-                0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x16,
-                0xac, 0xd9, 0x40, 0x78, 0x02, 0x27, 0xe5, 0xc0,
-                0x44, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00,
-                0x03, 0x00, 0xca, 0x3c, 0x48, 0x96, 0x11, 0x80,
-                // PPS
-                0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, 0xef, 0x20,
-                // IDR slice (產生黑畫面)
-                0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x80, 0x20,
-                0x11, 0x21, 0xa0,
-        }
-	go func() {
-		ticker := time.NewTicker(time.Second / 30)
-		defer ticker.Stop()
-		for range ticker.C {
-			tracksMu.Lock()
-			for _, t := range videoTracks {
-				t.WriteSample(media.Sample{Data: fakeFrame, Duration: time.Second / 30})
-			}
-			tracksMu.Unlock()
-		}
-	}()
+        // 讀取視訊串流並保存，同時推送到所有 WebRTC 連線（另起 goroutine）
+        go func() {
+                frameCount := 0
+                totalBytes := int64(0)
+                startTime := time.Now()
+                meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
 
-	// 讀取視訊串流並保存（另起 goroutine）
-	go func() {
-		frameCount := 0
-		totalBytes := int64(0)
-		startTime := time.Now()
-		meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
+                for {
+                        if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
+                                log.Println("read frame meta:", err)
+                                break
+                        }
+                        frameSize := binary.BigEndian.Uint32(meta[8:12])
 
-		for {
-			if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
-				log.Println("read frame meta:", err)
-				break
-			}
-			frameSize := binary.BigEndian.Uint32(meta[8:12])
+                        frame := make([]byte, frameSize)
+                        if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
+                                log.Println("read frame:", err)
+                                break
+                        }
 
-			frame := make([]byte, frameSize)
-			if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
-				log.Println("read frame:", err)
-				break
-			}
+                        if _, err := outFile.Write(frame); err != nil {
+                                log.Println("write error:", err)
+                                break
+                        }
 
-			if _, err := outFile.Write(frame); err != nil {
-				log.Println("write error:", err)
-				break
-			}
+                        // 將影格推送給所有目前的 WebRTC 連線
+                        tracksMu.Lock()
+                        for _, t := range videoTracks {
+                                if err := t.WriteSample(media.Sample{Data: frame, Duration: time.Second / 30}); err != nil {
+                                        log.Println("write sample:", err)
+                                }
+                        }
+                        tracksMu.Unlock()
 
-			frameCount++
-			totalBytes += int64(frameSize)
-			if frameCount%100 == 0 {
-				elapsed := time.Since(startTime).Seconds()
-				bytesPerSecond := float64(totalBytes) / elapsed
-				log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
-					frameCount,
-					bytesPerSecond/(1024*1024))
-			}
-		}
-	}()
+                        frameCount++
+                        totalBytes += int64(frameSize)
+                        if frameCount%100 == 0 {
+                                elapsed := time.Since(startTime).Seconds()
+                                bytesPerSecond := float64(totalBytes) / elapsed
+                                log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
+                                        frameCount,
+                                        bytesPerSecond/(1024*1024))
+                        }
+                }
+        }()
 
 	select {} // 保持程式執行
 }
