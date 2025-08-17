@@ -21,11 +21,21 @@
         ]
     });
     const status = document.getElementById("stat");
-    ws.onopen = () => status.textContent = "WebSocket 已連線";
-    ws.onerror = () => status.textContent = "WebSocket 錯誤";
-    ws.onclose = () => status.textContent = "WebSocket 已關閉";
+    ws.onopen = (e) => {
+        console.log('WebSocket opened:', e);
+        status.textContent = "WebSocket 已連線";
+    };
+    ws.onerror = (e) => {
+        console.error('WebSocket error:', e);
+        status.textContent = "WebSocket 錯誤";
+    };
+    ws.onclose = (e) => {
+        console.warn('WebSocket closed:', e);
+        status.textContent = "WebSocket 已關閉";
+    };
 
     ws.onmessage = async (event) => {
+        console.log('WebSocket message:', event.data);
         const msg = JSON.parse(event.data);
         if (msg.sdp) {
             console.log('Received SDP:', msg.sdp);
@@ -39,17 +49,21 @@
                 console.log('Modified SDP:', msg.sdp.sdp);
             }
             
+            console.log('Setting remote description');
             await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
             status.textContent = "收到 SDP: " + msg.sdp.type;
-            
+
             if (msg.sdp.type === "offer") {
                 const answer = await pc.createAnswer();
                 console.log('Created answer:', answer);
+                console.log('Setting local description');
                 await pc.setLocalDescription(answer);
                 ws.send(JSON.stringify({sdp: pc.localDescription}));
+                console.log('Sent SDP answer');
             }
         }
         if (msg.candidate) {
+            console.log('Received ICE candidate:', msg.candidate);
             await pc.addIceCandidate(msg.candidate);
             status.textContent = "收到 ICE 候選";
         }
@@ -57,7 +71,10 @@
 
     pc.onicecandidate = (event) => {
         if (event.candidate) {
+            console.log('Sending ICE candidate:', event.candidate);
             ws.send(JSON.stringify({candidate: event.candidate}));
+        } else {
+            console.log('All ICE candidates sent');
         }
     };
 
@@ -76,7 +93,7 @@
     };
 
     pc.ontrack = (event) => {
-        console.log('Got track:', event.track.kind);
+        console.log('Got track:', event.track.kind, 'streams:', event.streams);
         const videoElem = document.getElementById("remoteVideo");
         videoElem.srcObject = event.streams[0];
         status.textContent = "已取得視訊串流";
@@ -93,7 +110,23 @@
         videoElem.onplay = () => {
             console.log('Video started playing');
         };
-        
+
+        videoElem.onpause = () => {
+            console.warn('Video paused');
+        };
+
+        videoElem.onwaiting = () => {
+            console.log('Video waiting for data');
+        };
+
+        videoElem.onstalled = () => {
+            console.warn('Video stalled');
+        };
+
+        videoElem.onended = () => {
+            console.warn('Video ended');
+        };
+
         videoElem.onerror = (e) => {
             console.error('Video error:', e);
             status.textContent = "視訊錯誤: " + e.target.error.message;
