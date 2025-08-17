@@ -1,104 +1,163 @@
-// 這是一個以 Go 撰寫的簡易 scrcpy 客戶端範例，用於保存視訊串流
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
-	"io"
+	"encoding/json"
 	"log"
-	"os"
+	"net/http"
+	"sync"
 	"time"
 
-	"github.com/yourname/scrcpy-go/adb"
+	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
-func main() {
-	// 連線到第一台可用的裝置
-	dev, err := adb.NewDevice("")
+var (
+	upgrader    = websocket.Upgrader{}
+	tracksMu    sync.Mutex
+	videoTracks []*webrtc.TrackLocalStaticSample
+	whiteFrame  []byte
+)
+
+func init() {
+	whiteFrame = []byte{
+		0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x0C, 0x8D, 0x8D, 0x40, 0x50, 0x1E, 0xD0, 0x0B, 0x80, 0x00, 0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0xF1, 0x83, 0x19, 0x60,
+		0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x06, 0xE2,
+		0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00,
+	}
+	for i := 0; i < 256; i++ {
+		whiteFrame = append(whiteFrame, 0xFF)
+	}
+	for i := 0; i < 64; i++ {
+		whiteFrame = append(whiteFrame, 0x80)
+	}
+	for i := 0; i < 64; i++ {
+		whiteFrame = append(whiteFrame, 0x80)
+	}
+}
+
+// signalHandler 提供簡易的 WebRTC 信令處理，透過 WebSocket 與瀏覽器交換 SDP/ICE。
+// 每次瀏覽器連線都建立新的 PeerConnection 與 Track，避免重整後狀態不一致。
+func signalHandler(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Fatal(err)
+		log.Println("upgrade:", err)
+		return
 	}
+	defer ws.Close()
 
-	// 透過 adb reverse 將裝置連線轉回本機，便於伺服器傳送資料
-	if err := dev.Reverse("localabstract:scrcpy", "tcp:27183"); err != nil {
-		log.Fatal("reverse:", err)
-	}
-
-	// 將伺服器檔案推送至裝置暫存目錄
-	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
-		log.Fatal("push server:", err)
-	}
-
-	// 啟動 scrcpy 伺服器並取得視訊串流
-	conn, err := dev.StartServer()
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		},
+	})
 	if err != nil {
-		log.Fatal("start server:", err)
+		log.Println("webrtc:", err)
+		return
 	}
-	defer conn.VideoStream.Close()
-	defer conn.Control.Close()
+	defer pc.Close()
 
-	// 建立輸出檔案
-	outFile, err := os.Create("output.h264")
+	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		log.Printf("Peer Connection State has changed: %s\n", s.String())
+	})
+
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+               webrtc.RTPCodecCapability{
+                       MimeType:    webrtc.MimeTypeH264,
+                       ClockRate:   90000,
+                       SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c00c",
+               },
+		"video", "scrcpy",
+	)
 	if err != nil {
-		log.Fatal("create output file:", err)
+		log.Println("track:", err)
+		return
 	}
-	defer outFile.Close()
-
-	log.Println("開始接收視訊串流，儲存至 output.h264")
-
-	// 讀取並略過裝置名稱封包 (64 bytes)
-	nameBuf := make([]byte, 64)
-	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
-		log.Fatal("read device name:", err)
+	sender, err := pc.AddTrack(videoTrack)
+	if err != nil {
+		log.Println("add track:", err)
+		return
 	}
-	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
-	log.Printf("裝置名稱: %s\n", deviceName)
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, err := sender.Read(rtcpBuf); err != nil {
+				return
+			}
+		}
+	}()
 
-	// 讀取視訊編碼格式與解析度資訊 (12 bytes)
-	vHeader := make([]byte, 12)
-	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
-		log.Fatal("read video header:", err)
+	tracksMu.Lock()
+	videoTracks = append(videoTracks, videoTrack)
+	tracksMu.Unlock()
+	defer func() {
+		tracksMu.Lock()
+		for i, t := range videoTracks {
+			if t == videoTrack {
+				videoTracks = append(videoTracks[:i], videoTracks[i+1:]...)
+				break
+			}
+		}
+		tracksMu.Unlock()
+	}()
+
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		cand, _ := json.Marshal(c.ToJSON())
+		ws.WriteJSON(map[string]interface{}{"candidate": json.RawMessage(cand)})
+	})
+
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		log.Println("offer:", err)
+		return
 	}
-	codec := string(vHeader[:4])
-	width := binary.BigEndian.Uint32(vHeader[4:8])
-	height := binary.BigEndian.Uint32(vHeader[8:12])
-	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, width, height)
-
-	// 讀取視訊串流並保存
-	frameCount := 0
-	totalBytes := int64(0)
-	startTime := time.Now()
-	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
+	if err = pc.SetLocalDescription(offer); err != nil {
+		log.Println("set local desc:", err)
+		return
+	}
+	ws.WriteJSON(map[string]interface{}{"sdp": offer})
 
 	for {
-		// 讀取影格中繼資料
-		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
-			log.Println("read frame meta:", err)
+		var msg map[string]json.RawMessage
+		if err := ws.ReadJSON(&msg); err != nil {
+			log.Println("ws read:", err)
 			break
 		}
-		frameSize := binary.BigEndian.Uint32(meta[8:12])
-
-		// 依照封包長度讀取完整影格
-		frame := make([]byte, frameSize)
-		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
-			log.Println("read frame:", err)
-			break
+		if sdp, ok := msg["sdp"]; ok {
+			var desc webrtc.SessionDescription
+			json.Unmarshal(sdp, &desc)
+			pc.SetRemoteDescription(desc)
 		}
-
-		// 寫入影格資料
-		if _, err := outFile.Write(frame); err != nil {
-			log.Println("write error:", err)
-			break
+		if cand, ok := msg["candidate"]; ok {
+			var ice webrtc.ICECandidateInit
+			json.Unmarshal(cand, &ice)
+			pc.AddICECandidate(ice)
 		}
+	}
+}
 
-		frameCount++
-		totalBytes += int64(frameSize)
-		if frameCount%100 == 0 {
-			elapsed := time.Since(startTime).Seconds()
-			bytesPerSecond := float64(totalBytes) / elapsed
-			log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
-				frameCount,
-				bytesPerSecond/(1024*1024))
+func main() {
+	http.HandleFunc("/ws", signalHandler)
+	fs := http.FileServer(http.Dir("."))
+	http.Handle("/", fs)
+	go func() {
+		log.Println("HTTP/WebSocket 伺服器啟動於 http://localhost:8080/webrtc_frontend.html")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Fatal("http server:", err)
 		}
+	}()
+
+	ticker := time.NewTicker(time.Second / 30)
+	for range ticker.C {
+		tracksMu.Lock()
+		for _, t := range videoTracks {
+			if err := t.WriteSample(media.Sample{Data: whiteFrame, Duration: time.Second / 30}); err != nil {
+				log.Println("write sample:", err)
+			}
+		}
+		tracksMu.Unlock()
 	}
 }
