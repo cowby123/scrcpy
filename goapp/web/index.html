@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebRTC 白畫面 PoC (H.264)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Noto Sans TC, sans-serif; margin: 24px; }
+    video { width: 100%; max-width: 960px; background: #000; }
+    .row { margin: 12px 0; }
+    label { display: block; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <h1>WebRTC 白畫面 PoC (H.264)</h1>
+  <div class="row"><button id="start">Start</button></div>
+  <video id="v" autoplay playsinline controls muted></video>
+
+  <script>
+  const start = document.getElementById('start');
+  const video = document.getElementById('v');
+
+  start.onclick = async () => {
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }]
+    });
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.ontrack = (ev) => {
+      if (ev.streams && ev.streams[0]) {
+        video.srcObject = ev.streams[0];
+      } else {
+        const ms = new MediaStream();
+        ms.addTrack(ev.track);
+        video.srcObject = ms;
+      }
+    };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const res = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pc.localDescription)
+    });
+    const answer = await res.json();
+    await pc.setRemoteDescription(answer);
+    start.disabled = true;
+  };
+  </script>
+</body>
+</html>

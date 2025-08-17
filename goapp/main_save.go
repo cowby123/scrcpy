@@ -69,7 +69,7 @@ func main() {
 	totalBytes := int64(0)
 	startTime := time.Now()
 	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
-
+	go RunRTC()
 	for {
 		// 讀取影格中繼資料
 		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
