@@ -2,10 +2,10 @@ package main
 
 import (
 	"encoding/json"
-        "fmt"
+	"fmt"
 	"log"
 	"net/http"
-        "sync"
+	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -21,26 +21,27 @@ var (
 type Frame struct {
 	Data     []byte
 	Duration time.Duration
+	Key      bool
 }
 
 var (
-        frameCh = make(chan Frame, 128)
-        profileMu sync.RWMutex
-        profileLevelID = "42e01f"
+	frameCh        = make(chan Frame, 128)
+	profileMu      sync.RWMutex
+	profileLevelID = "42e01f"
 )
+
 func getProfileLevelID() string {
-        profileMu.RLock()
-        id := profileLevelID
-        profileMu.RUnlock()
-        return id
+	profileMu.RLock()
+	id := profileLevelID
+	profileMu.RUnlock()
+	return id
 }
 
 func setProfileLevelID(id string) {
-        profileMu.Lock()
-        profileLevelID = id
-        profileMu.Unlock()
+	profileMu.Lock()
+	profileLevelID = id
+	profileMu.Unlock()
 }
-
 
 func RunRTC() {
 	http.Handle("/", http.FileServer(http.Dir("./web")))
@@ -129,11 +130,18 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 	// 5) 從 frameCh 讀取 H.264 影格並寫入 Track
 	go func() {
+		seenKey := false
 		for {
 			select {
 			case <-closed:
 				return
 			case f := <-frameCh:
+				if !seenKey {
+					if !f.Key {
+						continue
+					}
+					seenKey = true
+				}
 				if err := videoTrack.WriteSample(media.Sample{Data: f.Data, Duration: f.Duration}); err != nil {
 					log.Println("write sample:", err)
 				}
