@@ -52,6 +52,9 @@ var (
 	havePTS0 bool
 	pts0     uint64
 	rtpTS0   uint32 // 可為 0；保留擴充空間（若要做 offset）
+
+	pointerMu      sync.Mutex
+	pointerButtons = make(map[uint64]uint32)
 )
 
 func main() {
@@ -72,7 +75,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := dev.Reverse("localabstract:scrcpy", "tcp:27183"); err != nil {
+	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", adb.ScrcpyPort)); err != nil {
 		log.Fatal("reverse:", err)
 	}
 	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
@@ -440,11 +443,17 @@ func handleTouchEvent(ev touchEvent) {
 		return
 	}
 	var action uint8
+	var actionButton uint32
+
+	pointerMu.Lock()
+	prev := pointerButtons[ev.ID]
 	switch ev.Type {
 	case "down":
 		action = 0
+		actionButton = ev.Buttons &^ prev
 	case "up":
 		action = 1
+		actionButton = prev &^ ev.Buttons
 	case "move":
 		action = 2
 	case "cancel":
@@ -452,6 +461,9 @@ func handleTouchEvent(ev touchEvent) {
 	default:
 		action = 2
 	}
+	pointerButtons[ev.ID] = ev.Buttons
+	pointerMu.Unlock()
+
 	buf := make([]byte, 32)
 	buf[0] = 2 // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
 	buf[1] = action
@@ -462,8 +474,7 @@ func handleTouchEvent(ev touchEvent) {
 	binary.BigEndian.PutUint16(buf[20:], ev.Height)
 	p := uint16(ev.Pressure * 0xffff)
 	binary.BigEndian.PutUint16(buf[22:], p)
-	// action_button (24-27) 未使用
-	binary.BigEndian.PutUint32(buf[24:], 0)
+	binary.BigEndian.PutUint32(buf[24:], actionButton)
 	binary.BigEndian.PutUint32(buf[28:], ev.Buttons)
 	controlMu.Lock()
 	if _, err := controlConn.Write(buf); err != nil {
