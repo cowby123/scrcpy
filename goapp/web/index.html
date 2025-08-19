@@ -6,7 +6,11 @@
   <title>scrcpy WebRTC Demo</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; background:#111; display:flex; gap:16px; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; font-family:ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial; }
+    body {
+      margin:0; background:#111; display:flex; gap:16px;
+      flex-direction:column; align-items:center; justify-content:center;
+      min-height:100vh; font-family:ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial;
+    }
     header { color:#ddd; opacity:.9; }
     video {
       width:min(92vw, 900px);
@@ -14,11 +18,13 @@
       background:black;
       border-radius:12px;
       box-shadow:0 6px 30px rgba(0,0,0,.35);
-      /* 為了能接收原始多指觸控/手勢，交給 JS 處理 */
+      /* 交給 JS 處理多指觸控/手勢 */
       touch-action: none;
       -webkit-user-select: none;
       user-select: none;
       -webkit-tap-highlight-color: transparent;
+      /* 關鍵：讓瀏覽器等比縮放，黑邊可預測 */
+      object-fit: contain;
     }
     .row { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
     button { padding:10px 16px; border-radius:10px; border:1px solid #333; background:#1f1f1f; color:#ddd; cursor:pointer; }
@@ -46,6 +52,11 @@
 
   <script>
     const $ = (s)=>document.querySelector(s);
+    const videoEl = $("#video");
+    let pc, dc;
+    let forceStop = false;
+    const BLOCK_KEYS = [" ", "k", "MediaPlayPause"];
+
     const log = (...args) => {
       const msg = args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
       $("#log").textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
@@ -53,72 +64,111 @@
       console.log(...args);
     };
 
-    let pc;
-    const videoEl = $("#video");
-    const BLOCK_KEYS = [" ", "k", "MediaPlayPause"];
-    let forceStop = false;
-    let dc; // DataChannel for control
-
     // 永久關閉任何播放控制與菜單
     videoEl.controls = false;
     videoEl.setAttribute("disablepictureinpicture", "");
     videoEl.setAttribute("disableremoteplayback", "");
     videoEl.setAttribute("controlslist", "nodownload noplaybackrate noremoteplayback nofullscreen");
     videoEl.addEventListener("contextmenu", e => e.preventDefault());
-    // 阻止點擊/雙擊造成全螢幕或暫停
     ["click","dblclick"].forEach(type => videoEl.addEventListener(type, e => e.preventDefault(), { capture:true }));
-
-    // 若外部嘗試暫停，立刻恢復播放（除非是我們主動 stop）
     videoEl.addEventListener("pause", () => { if (!forceStop) videoEl.play().catch(()=>{}); });
+    window.addEventListener("keydown", (e) => { if (BLOCK_KEYS.includes(e.key)) e.preventDefault(); }, { capture: true });
 
-    // 阻擋鍵盤的播放/暫停快捷鍵
-    window.addEventListener("keydown", (e) => {
-      if (BLOCK_KEYS.includes(e.key)) e.preventDefault();
-    }, { capture: true });
-
-    // ===== 觸控/指針事件骨架（保留互動，不影響未來傳 ADB） =====
-    function normPoint(e) {
+    // ======= 影像顯示區與座標換算（扣黑邊 → 原生像素）=======
+    function computeDisplayRect() {
       const r = videoEl.getBoundingClientRect();
-      const x = (e.clientX - r.left) / r.width;
-      const y = (e.clientY - r.top) / r.height;
-      return { x, y, w: r.width, h: r.height };
+      const vw = videoEl.videoWidth  || r.width;   // 影片原生寬
+      const vh = videoEl.videoHeight || r.height;  // 影片原生高
+      const scale = Math.min(r.width / vw, r.height / vh);
+      const displayW = vw * scale;
+      const displayH = vh * scale;
+      const offsetX = (r.width  - displayW) / 2;
+      const offsetY = (r.height - displayH) / 2;
+      return { box: r, vw, vh, displayW, displayH, offsetX, offsetY };
     }
-    function sendTouch(type, e) {
-      const r = videoEl.getBoundingClientRect();
-      const payload = {
-        type,
-        id: e.pointerId,
-        x: Math.round(e.clientX - r.left),
-        y: Math.round(e.clientY - r.top),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-        pressure: e.pressure || 0,
-        buttons: e.buttons || 0,
-      };
-      if (dc && dc.readyState === "open") {
-        dc.send(JSON.stringify(payload));
+
+    // 回傳：是否在顯示區；原生像素 ix/iy；以及 scrcpy 要的 screenW/H（= 原生寬高）
+    function mapToVideoPixel(e) {
+      const { box: r, vw, vh, displayW, displayH, offsetX, offsetY } = computeDisplayRect();
+      const xPx = e.clientX - r.left - offsetX;
+      const yPx = e.clientY - r.top  - offsetY;
+
+      // 在黑邊外就忽略
+      if (xPx < 0 || yPx < 0 || xPx > displayW || yPx > displayH) {
+        return { inside: false };
       }
-      log(`touch:${type}`, payload);
+
+      // 顯示區 → 0~1 → 原生像素
+      const nx = displayW > 0 ? (xPx / displayW) : 0;
+      const ny = displayH > 0 ? (yPx / displayH) : 0;
+      const ix = Math.round(nx * vw);
+      const iy = Math.round(ny * vh);
+
+      return { inside: true, ix, iy, screenW: vw|0, screenH: vh|0 };
     }
+
+    // ======= DataChannel 傳控制 =======
+    function sendControl(payload) {
+      if (!dc || dc.readyState !== "open") return false;
+      try { dc.send(JSON.stringify(payload)); return true; }
+      catch { return false; }
+    }
+
+    function sendTouch(type, e) {
+      const m = mapToVideoPixel(e);
+      if (!m.inside) return; // 忽略黑邊外的事件
+
+      const payload = {
+        type,                 // "down" | "move" | "up" | "cancel"
+        id: e.pointerId,
+        x: m.ix, y: m.iy,     // 原生像素
+        screenW: m.screenW,   // 原生寬
+        screenH: m.screenH,   // 原生高
+        pressure: e.pressure ?? 0,
+        buttons:  e.buttons  ?? 0,
+        pointerType: e.pointerType || "mouse"
+      };
+
+      // 優先走 DataChannel
+      const ok = sendControl(payload);
+      log(`touch:${type}${ok ? "" : " (DC未開啟)"}`, payload);
+    }
+
+    // 指針事件（多指）
     videoEl.addEventListener("pointerdown", (e) => {
       videoEl.setPointerCapture?.(e.pointerId);
       sendTouch("down", e);
       e.preventDefault();
     }, { passive:false });
+
     videoEl.addEventListener("pointermove", (e) => {
       if (e.pressure !== 0 || e.buttons) sendTouch("move", e);
       e.preventDefault();
     }, { passive:false });
+
     videoEl.addEventListener("pointerup", (e) => {
       sendTouch("up", e);
       e.preventDefault();
     }, { passive:false });
+
     videoEl.addEventListener("pointercancel", (e) => {
       sendTouch("cancel", e);
       e.preventDefault();
     }, { passive:false });
-    // ======================================================
 
+    // 印出影像尺寸變化，方便比對 server videoSize
+    videoEl.addEventListener("loadedmetadata", () => {
+      const { vw, vh, displayW, displayH } = computeDisplayRect();
+      log("video meta", { vw, vh, displayW: Math.round(displayW), displayH: Math.round(displayH) });
+    });
+    ["resize","orientationchange"].forEach(ev =>
+      window.addEventListener(ev, () => {
+        const { displayW, displayH } = computeDisplayRect();
+        log("displayRect", { w: Math.round(displayW), h: Math.round(displayH) });
+      })
+    );
+
+    // ======= WebRTC =======
     function waitForIceComplete(pc) {
       return new Promise(resolve => {
         if (pc.iceGatheringState === "complete") return resolve();
@@ -139,15 +189,17 @@
         forceStop = false;
 
         pc = new RTCPeerConnection();
-        dc = pc.createDataChannel("control");
-        dc.onopen = () => log("DataChannel open");
+
+        // 建立控制用 DataChannel（由瀏覽器端主動開）
+        dc = pc.createDataChannel("control", { ordered: true });
+        dc.onopen  = () => log("DataChannel open");
         dc.onclose = () => log("DataChannel closed");
+        dc.onerror = (e) => log("DataChannel error", e?.message || e);
 
         // 顯示遠端影像
         pc.ontrack = (e) => {
           if (!videoEl.srcObject) {
             videoEl.srcObject = e.streams[0];
-            // 某些瀏覽器需要顯式 play()
             videoEl.play().catch(()=>{});
           }
         };
@@ -165,18 +217,16 @@
           }
         }
 
-        // 事件監控
-        pc.onconnectionstatechange = () => log("PeerConnection:", pc.connectionState);
-        pc.oniceconnectionstatechange = () => log("ICE:", pc.iceConnectionState);
-        pc.onicegatheringstatechange = () => log("ICE Gathering:", pc.iceGatheringState);
-        pc.onicecandidateerror = (e) => log("ICE Candidate Error:", e.errorText || e);
+        pc.onconnectionstatechange     = () => log("PeerConnection:", pc.connectionState);
+        pc.oniceconnectionstatechange  = () => log("ICE:", pc.iceConnectionState);
+        pc.onicegatheringstatechange   = () => log("ICE Gathering:", pc.iceGatheringState);
+        pc.onicecandidateerror         = (e) => log("ICE Candidate Error:", e.errorText || e);
 
-        // 產生 Offer 並等待 ICE 完成（與後端 non-trickle 對齊）
+        // SDP 交換（non-trickle）
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         await waitForIceComplete(pc);
 
-        // 傳送給 Go backend
         const resp = await fetch("/offer", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -218,7 +268,7 @@
     $("#btnStart").addEventListener("click", start);
     $("#btnStop").addEventListener("click", stop);
 
-    // 自動嘗試連線（可手動改成只按鈕觸發）
+    // 自動嘗試連線（可改為只按鈕觸發）
     start();
   </script>
 </body>
