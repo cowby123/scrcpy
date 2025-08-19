@@ -39,6 +39,7 @@ var (
 
 	startTime   time.Time // 速率統計
 	controlConn io.Writer // 與 Android 控制通道
+	controlMu   sync.Mutex
 
 	// 觀測 PLI/FIR 與 AU 序號、RTP 詳細列印
 	lastPLI       time.Time
@@ -302,6 +303,18 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		log.Println("DataChannel:", dc.Label())
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			var ev touchEvent
+			if err := json.Unmarshal(msg.Data, &ev); err != nil {
+				log.Println("datachannel unmarshal:", err)
+				return
+			}
+			handleTouchEvent(ev)
+		})
+	})
+
 	// 讀 RTCP：解析並印出 PLI / FIR，並請求關鍵幀
 	go func() {
 		rtcpBuf := make([]byte, 1500)
@@ -404,9 +417,59 @@ func requestKeyframe() {
 	if controlConn == nil {
 		return
 	}
+	controlMu.Lock()
+	defer controlMu.Unlock()
 	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
 		log.Println("send RESET_VIDEO:", err)
 	}
+}
+
+type touchEvent struct {
+	Type     string  `json:"type"`
+	ID       uint64  `json:"id"`
+	X        int32   `json:"x"`
+	Y        int32   `json:"y"`
+	Width    uint16  `json:"width"`
+	Height   uint16  `json:"height"`
+	Pressure float64 `json:"pressure"`
+	Buttons  uint32  `json:"buttons"`
+}
+
+func handleTouchEvent(ev touchEvent) {
+	if controlConn == nil {
+		return
+	}
+	var action uint8
+	switch ev.Type {
+	case "down":
+		action = 0
+	case "up":
+		action = 1
+	case "move":
+		action = 2
+	case "cancel":
+		action = 3
+	default:
+		action = 2
+	}
+	buf := make([]byte, 32)
+	buf[0] = 2 // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
+	buf[1] = action
+	binary.BigEndian.PutUint64(buf[2:], ev.ID)
+	binary.BigEndian.PutUint32(buf[10:], uint32(ev.X))
+	binary.BigEndian.PutUint32(buf[14:], uint32(ev.Y))
+	binary.BigEndian.PutUint16(buf[18:], ev.Width)
+	binary.BigEndian.PutUint16(buf[20:], ev.Height)
+	p := uint16(ev.Pressure * 0xffff)
+	binary.BigEndian.PutUint16(buf[22:], p)
+	// action_button (24-27) 未使用
+	binary.BigEndian.PutUint32(buf[24:], 0)
+	binary.BigEndian.PutUint32(buf[28:], ev.Buttons)
+	controlMu.Lock()
+	if _, err := controlConn.Write(buf); err != nil {
+		log.Println("send touch event:", err)
+	}
+	controlMu.Unlock()
 }
 
 // === RTP 發送（以指定 TS） ===
