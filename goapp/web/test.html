@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <!-- 滿版 + 安全區 + 禁止縮放（行動裝置） -->
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <title>scrcpy WebRTC</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body {
+      margin: 0; width: 100%; height: 100%;
+      background: #000;
+      overflow: hidden;              /* 不要捲動條 */
+      overscroll-behavior: none;     /* 避免下拉刷新/滾動串連 */
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial;
+    }
+    /* iOS/Android 瀏海與手勢列安全區 */
+    body {
+      padding: env(safe-area-inset-top) env(safe-area-inset-right)
+               env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+    /* 滿版影片（等比，黑邊可預測） */
+    video {
+      position: fixed; inset: 0;
+      width: 100vw;
+      height: 100dvh;   /* 動態視窗高（行動瀏覽器工具列顯示/隱藏時會跟著調整） */
+      min-height: 100vh;
+      background: #000;
+      object-fit: contain;
+      border: 0;
+      touch-action: none;            /* 交給 JS 處理手勢（禁用瀏覽器預設平移/縮放） */
+      -webkit-user-select: none; user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+  </style>
+</head>
+<body>
+  <!-- 禁用所有內建控制與選單 -->
+  <video id="video" autoplay playsinline muted
+         disablepictureinpicture disableremoteplayback
+         controlslist="nodownload noplaybackrate noremoteplayback nofullscreen"></video>
+
+  <script>
+    const $ = s => document.querySelector(s);
+    const videoEl = $("#video");
+    let pc, dc;
+    let forceStop = false;
+
+    // 關閉任何控制與長按菜單
+    videoEl.controls = false;
+    videoEl.addEventListener("contextmenu", e => e.preventDefault(), { capture: true });
+    ["click", "dblclick"].forEach(t => videoEl.addEventListener(t, e => e.preventDefault(), { capture: true }));
+    videoEl.addEventListener("pause", () => { if (!forceStop) videoEl.play().catch(()=>{}); });
+
+    // ===== 影像顯示區與座標換算（扣黑邊 → 影片原生像素）=====
+    function computeDisplayRect() {
+      const r  = videoEl.getBoundingClientRect();
+      const vw = videoEl.videoWidth  || r.width;
+      const vh = videoEl.videoHeight || r.height;
+      const scale = Math.min(r.width / vw, r.height / vh);
+      const displayW = vw * scale, displayH = vh * scale;
+      const offsetX = (r.width  - displayW) / 2;
+      const offsetY = (r.height - displayH) / 2;
+      return { box: r, vw, vh, displayW, displayH, offsetX, offsetY };
+    }
+    function mapToVideoPixel(e) {
+      const { box:r, vw, vh, displayW, displayH, offsetX, offsetY } = computeDisplayRect();
+      const xPx = e.clientX - r.left - offsetX;
+      const yPx = e.clientY - r.top  - offsetY;
+      if (xPx < 0 || yPx < 0 || xPx > displayW || yPx > displayH) return { inside:false };
+      const nx = displayW ? (xPx / displayW) : 0;
+      const ny = displayH ? (yPx / displayH) : 0;
+      const ix = Math.round(nx * vw);
+      const iy = Math.round(ny * vh);
+      return { inside:true, ix, iy, screenW: vw|0, screenH: vh|0 };
+    }
+
+    // ===== DataChannel 傳控制 =====
+    function sendControl(payload) {
+      if (!dc || dc.readyState !== "open") return false;
+      try { dc.send(JSON.stringify(payload)); return true; } catch { return false; }
+    }
+    function sendTouch(type, e) {
+      const m = mapToVideoPixel(e);
+      if (!m.inside) return;
+      const payload = {
+        type, id: e.pointerId,
+        x: m.ix, y: m.iy,
+        width: m.screenW, height: m.screenH,   // 兼容你的 Go 結構（即使伺服端會忽略）
+        pressure: e.pressure ?? 0,
+        buttons:  e.buttons  ?? 0,
+        pointerType: e.pointerType || "touch"
+      };
+      sendControl(payload);
+    }
+
+    // 多指觸控事件
+    videoEl.addEventListener("pointerdown", (e) => {
+      videoEl.setPointerCapture?.(e.pointerId);
+      sendTouch("down", e);
+      e.preventDefault();
+    }, { passive:false });
+    videoEl.addEventListener("pointermove", (e) => {
+      if (e.pressure !== 0 || e.buttons) sendTouch("move", e);
+      e.preventDefault();
+    }, { passive:false });
+    videoEl.addEventListener("pointerup", (e) => {
+      sendTouch("up", e);
+      e.preventDefault();
+    }, { passive:false });
+    videoEl.addEventListener("pointercancel", (e) => {
+      sendTouch("cancel", e);
+      e.preventDefault();
+    }, { passive:false });
+
+    // 影像中繼：載入後印一行 console（方便除錯）
+    videoEl.addEventListener("loadedmetadata", () => {
+      const { vw, vh } = computeDisplayRect();
+      console.log("[video] meta", { vw, vh });
+    });
+
+    // ===== WebRTC =====
+    function waitForIceComplete(pc) {
+      return new Promise(resolve => {
+        if (pc.iceGatheringState === "complete") return resolve();
+        const h = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", h); resolve(); } };
+        pc.addEventListener("icegatheringstatechange", h);
+      });
+    }
+    async function start() {
+      try {
+        forceStop = false;
+        pc = new RTCPeerConnection();
+        // 控制通道（瀏覽器端主動開）
+        dc = pc.createDataChannel("control", { ordered: true });
+        dc.onopen  = () => console.log("[dc] open");
+        dc.onclose = () => console.log("[dc] closed");
+        dc.onerror = (e) => console.log("[dc] error", e?.message || e);
+
+        // 顯示遠端影像
+        pc.ontrack = (e) => {
+          if (!videoEl.srcObject) {
+            videoEl.srcObject = e.streams[0];
+            videoEl.play().catch(()=>{});
+          }
+        };
+
+        // 收視訊（recvonly），偏好 H.264
+        const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
+        const caps = RTCRtpReceiver.getCapabilities("video");
+        if (caps && caps.codecs) {
+          const h264 = caps.codecs.filter(c => (c.mimeType || c.mimeTypeCanonical || "").toLowerCase() === "video/h264");
+          if (h264.length) transceiver.setCodecPreferences(h264);
+        }
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitForIceComplete(pc);
+
+        const resp = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(pc.localDescription),
+        });
+        if (!resp.ok) throw new Error(`Offer 送出失敗: ${resp.status} ${resp.statusText}`);
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+        console.log("[webrtc] connected, waiting for frames…");
+      } catch (err) {
+        console.error("[webrtc] error:", err);
+      }
+    }
+    async function stop() {
+      try {
+        forceStop = true;
+        if (pc) {
+          pc.getTransceivers().forEach(t => t.stop && t.stop());
+          pc.getSenders().forEach(s => s.track && s.track.stop());
+          pc.getReceivers().forEach(r => r.track && r.track.stop());
+          pc.close(); pc = null;
+        }
+        if (videoEl.srcObject) {
+          videoEl.srcObject.getTracks().forEach(t => t.stop());
+          videoEl.srcObject = null;
+        }
+      } catch {}
+    }
+    window.addEventListener("beforeunload", stop);
+
+    // 可選：避免螢幕自動變暗/鎖定（需 HTTPS 與瀏覽器支援）
+    async function keepAwake() {
+      try {
+        if ('wakeLock' in navigator) {
+          let lock = await navigator.wakeLock.request('screen');
+          document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState === 'visible') {
+              try { lock = await navigator.wakeLock.request('screen'); } catch {}
+            }
+          });
+        }
+      } catch {}
+    }
+
+    // 自動連線與常亮
+    keepAwake();
+    start();
+  </script>
+</body>
+</html>
