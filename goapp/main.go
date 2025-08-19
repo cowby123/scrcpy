@@ -18,6 +18,8 @@ import (
 	"github.com/yourname/scrcpy-go/adb"
 )
 
+const controlMsgResetVideo = 17
+
 // === 全域狀態 ===
 var (
 	videoTrack   *webrtc.TrackLocalStaticRTP
@@ -29,7 +31,8 @@ var (
 	lastPPS      []byte
 	stateMu      sync.RWMutex
 
-	startTime time.Time // 只用來印速率統計
+	startTime   time.Time // 只用來印速率統計
+	controlConn io.Writer // 與 Android 控制通道
 )
 
 func main() {
@@ -61,6 +64,7 @@ func main() {
 	}
 	defer conn.VideoStream.Close()
 	defer conn.Control.Close()
+	controlConn = conn.Control
 
 	// 建立輸出檔案 (debug 用)
 	outFile, err := os.Create("output.h264")
@@ -284,9 +288,22 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	needKeyframe = true // 新用戶入房：先送 SPS/PPS，再等 IDR
 	stateMu.Unlock()
 
+	// 請求 Android 立刻送出關鍵幀
+	requestKeyframe()
+
 	// 回傳 Answer（含 ICE）
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(pc.LocalDescription())
+}
+
+// requestKeyframe 要求 Android 重新送出關鍵幀
+func requestKeyframe() {
+	if controlConn == nil {
+		return
+	}
+	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
+		log.Println("send RESET_VIDEO:", err)
+	}
 }
 
 // === Annex-B 工具與發送 ===
