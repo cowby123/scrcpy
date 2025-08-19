@@ -20,16 +20,17 @@ import (
 
 // === 全域狀態 ===
 var (
-	videoTrack   *webrtc.TrackLocalStaticRTP
-	peerConn     *webrtc.PeerConnection
-	packetizer   rtp.Packetizer
-	rtpTS        uint32 // 90kHz 時基
-	needKeyframe bool   // 新用戶/PLI 時需要 SPS/PPS + IDR
-	lastSPS      []byte
-	lastPPS      []byte
-	stateMu      sync.RWMutex
+        videoTrack   *webrtc.TrackLocalStaticRTP
+        peerConn     *webrtc.PeerConnection
+        packetizer   rtp.Packetizer
+        rtpTS        uint32 // 90kHz 時基
+        needKeyframe bool   // 新用戶/PLI 時需要 SPS/PPS + IDR
+        lastSPS      []byte
+        lastPPS      []byte
+        stateMu      sync.RWMutex
 
-	startTime time.Time // 只用來印速率統計
+       startTime time.Time // 只用來印速率統計
+       lastPTS   uint64    // 上一幀的 pts，用來計算 RTP timestamp
 )
 
 func main() {
@@ -96,12 +97,15 @@ func main() {
 	var totalBytes int64
 
 	for {
-		// frame meta
-		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
-			log.Println("read frame meta:", err)
-			break
-		}
-		frameSize := binary.BigEndian.Uint32(meta[8:12])
+               // frame meta
+               if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
+                       log.Println("read frame meta:", err)
+                       break
+               }
+               ptsAndFlags := binary.BigEndian.Uint64(meta[:8])
+               isConfig := (ptsAndFlags & (uint64(1) << 63)) != 0
+               pts := ptsAndFlags &^ (uint64(1)<<63 | uint64(1)<<62)
+               frameSize := binary.BigEndian.Uint32(meta[8:12])
 
 		// frame data
 		frame := make([]byte, frameSize)
@@ -134,36 +138,41 @@ func main() {
 			}
 		}
 
-		// 推進 WebRTC
-		stateMu.RLock()
-		vt := videoTrack
-		pk := packetizer
-		waitKF := needKeyframe
-		stateMu.RUnlock()
+               // 推進 WebRTC
+               stateMu.RLock()
+               vt := videoTrack
+               pk := packetizer
+               waitKF := needKeyframe
+               stateMu.RUnlock()
 
-		if vt != nil && pk != nil {
-			if waitKF {
-				// 先送參數集 (不前進 timestamp)
-				stateMu.RLock()
-				sps := lastSPS
-				pps := lastPPS
-				stateMu.RUnlock()
-				if len(sps) > 0 && len(pps) > 0 {
-					sendNALUs(sps, pps) // 同一 timestamp
-				}
-				// 等 IDR 才開流
-				if !idrInThisAU {
-					goto stats // 這幀不送
-				}
-				stateMu.Lock()
-				needKeyframe = false
-				stateMu.Unlock()
-				sendNALUAccessUnit(nalus) // 送這個含 IDR 的 AU，送完 +TS
-			} else {
-				// 正常持續送
-				sendNALUAccessUnit(nalus)
-			}
-		}
+               if vt != nil && pk != nil {
+                       if isConfig {
+                               // 配置資料 (SPS/PPS)，不前進 timestamp
+                               sendNALUs(nalus...)
+                               goto stats
+                       }
+                       if waitKF {
+                               // 先送參數集 (不前進 timestamp)
+                               stateMu.RLock()
+                               sps := lastSPS
+                               pps := lastPPS
+                               stateMu.RUnlock()
+                               if len(sps) > 0 && len(pps) > 0 {
+                                       sendNALUs(sps, pps) // 同一 timestamp
+                               }
+                               // 等 IDR 才開流
+                               if !idrInThisAU {
+                                       goto stats // 這幀不送
+                               }
+                               stateMu.Lock()
+                               needKeyframe = false
+                               stateMu.Unlock()
+                               sendNALUAccessUnit(nalus, pts)
+                       } else {
+                               // 正常持續送
+                               sendNALUAccessUnit(nalus, pts)
+                       }
+               }
 
 	stats:
 		frameCount++
@@ -272,17 +281,18 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	stateMu.Lock()
 	videoTrack = track
 	// 隨機 SSRC（簡化用時間來源），時基 90kHz
-	packetizer = rtp.NewPacketizer(
-		1200,                          // MTU
-		96,                            // Payload type
-		uint32(time.Now().UnixNano()), // SSRC
-		&codecs.H264Payloader{},
-		rtp.NewRandomSequencer(),
-		90000,
-	)
-	rtpTS = 0
-	needKeyframe = true // 新用戶入房：先送 SPS/PPS，再等 IDR
-	stateMu.Unlock()
+        packetizer = rtp.NewPacketizer(
+                1200,                          // MTU
+                96,                            // Payload type
+                uint32(time.Now().UnixNano()), // SSRC
+                &codecs.H264Payloader{},
+                rtp.NewRandomSequencer(),
+                90000,
+        )
+       rtpTS = 0
+       lastPTS = 0
+       needKeyframe = true // 新用戶入房：先送 SPS/PPS，再等 IDR
+        stateMu.Unlock()
 
 	// 回傳 Answer（含 ICE）
 	w.Header().Set("Content-Type", "application/json")
@@ -291,31 +301,36 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 // === Annex-B 工具與發送 ===
 
-// 把一個 Access Unit 的 NALUs 一次送完，最後一個 RTP 設 marker，送完再 +TS
-func sendNALUAccessUnit(nalus [][]byte) {
-	stateMu.RLock()
-	pk := packetizer
-	vt := videoTrack
-	ts := rtpTS
-	stateMu.RUnlock()
-	if pk == nil || vt == nil || len(nalus) == 0 {
-		return
-	}
+// 把一個 Access Unit 的 NALUs 一次送完，最後一個 RTP 設 marker，時間戳依 PTS 差值遞增
+func sendNALUAccessUnit(nalus [][]byte, pts uint64) {
+       stateMu.RLock()
+       pk := packetizer
+       vt := videoTrack
+       ts := rtpTS
+       prevPts := lastPTS
+       stateMu.RUnlock()
+       if pk == nil || vt == nil || len(nalus) == 0 {
+               return
+       }
 
-	for i, n := range nalus {
-		pkts := pk.Packetize(n, ts)
-		for j, p := range pkts {
-			// 僅最後一個 NALU 的最後一個 RTP 設 Marker=true
-			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
-			if err := vt.WriteRTP(p); err != nil {
-				log.Println("RTP write error:", err)
-			}
-		}
-	}
-	// 每幀 30fps → 90kHz/30 = 3000
-	stateMu.Lock()
-	rtpTS += 3000
-	stateMu.Unlock()
+       if prevPts != 0 && pts > prevPts {
+               ts += uint32((pts - prevPts) * 90000 / 1000000)
+       }
+
+       for i, n := range nalus {
+               pkts := pk.Packetize(n, ts)
+               for j, p := range pkts {
+                       // 僅最後一個 NALU 的最後一個 RTP 設 Marker=true
+                       p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
+                       if err := vt.WriteRTP(p); err != nil {
+                               log.Println("RTP write error:", err)
+                       }
+               }
+       }
+       stateMu.Lock()
+       rtpTS = ts
+       lastPTS = pts
+       stateMu.Unlock()
 }
 
 // 只送參數集（同一 timestamp，不遞增）
