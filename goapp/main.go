@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -20,9 +21,7 @@ import (
 )
 
 const controlMsgResetVideo = 17
-
-// 假設 scrcpy 的 PTS 單位為「微秒」
-const ptsPerSecond = uint64(1_000_000) // 1e6
+const ptsPerSecond = uint64(1_000_000) // scrcpy PTS 單位：微秒
 
 // === 全域狀態 ===
 var (
@@ -38,28 +37,36 @@ var (
 	stateMu sync.RWMutex
 
 	startTime   time.Time // 速率統計
-	controlConn io.Writer // 與 Android 控制通道
+	controlConn io.ReadWriter
+	controlMu   sync.Mutex
 
 	// 觀測 PLI/FIR 與 AU 序號、RTP 詳細列印
 	lastPLI       time.Time
 	pliCount      int
 	framesSinceKF int
 	auSeq         uint64
-	verboseRTP    = true // 設 true 會列印每個 NALU 的 RTP 切片與 Marker
+	verboseRTP    = true
 
 	// PTS → RTP Timestamp 映射
 	havePTS0 bool
 	pts0     uint64
-	rtpTS0   uint32 // 可為 0；保留擴充空間（若要做 offset）
+	rtpTS0   uint32
+
+	// 目前「視訊解析度」（給觸控封包的 screen_size）
+	videoW uint16
+	videoH uint16
+
+	pointerMu      sync.Mutex
+	pointerButtons = make(map[uint64]uint32)
 )
 
 func main() {
-	// 路由註冊
+	// 靜態檔案 + SDP handler
 	fs := http.FileServer(http.Dir("./web"))
 	http.Handle("/", fs)
 	http.HandleFunc("/offer", handleOffer)
 
-	// 啟動 HTTP（簡化）
+	// 啟動 HTTP
 	go func() {
 		log.Println("HTTP 伺服器: http://localhost:8080/  (SDP: POST /offer)")
 		srv := &http.Server{Addr: ":8080"}
@@ -71,7 +78,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := dev.Reverse("localabstract:scrcpy", "tcp:27183"); err != nil {
+	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", adb.ScrcpyPort)); err != nil {
 		log.Fatal("reverse:", err)
 	}
 	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
@@ -85,24 +92,27 @@ func main() {
 	defer conn.Control.Close()
 	controlConn = conn.Control
 
-	// ===== 每 5 秒固定請求一次關鍵幀 =====
+	// 重要：把控制通道讀掉，避免堆積阻塞
+	go func(r io.Reader) {
+		_, _ = io.Copy(io.Discard, r)
+	}(conn.Control)
+
+	// 週期性請求關鍵幀（可依需求調整或移除）
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			stateMu.Lock()
-			needKeyframe = true // 讓送流路徑在下一個 IDR 前 prepend SPS/PPS
+			needKeyframe = true
 			stateMu.Unlock()
-
-			log.Println("[KF] 週期性請求關鍵幀 (每 5 秒)")
+			log.Println("[KF] 週期性請求關鍵幀")
 			requestKeyframe()
 		}
 	}()
-	// =================================
 
-	log.Println("開始接收視訊串流（已停用磁碟寫入）")
+	log.Println("開始接收視訊串流")
 
-	// 跳過裝置名稱 (64 bytes)
+	// 跳過裝置名稱 (64 bytes, 以 NUL 結尾)
 	nameBuf := make([]byte, 64)
 	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
 		log.Fatal("read device name:", err)
@@ -110,18 +120,23 @@ func main() {
 	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
 	log.Printf("裝置名稱: %s\n", deviceName)
 
-	// 視訊標頭 (12 bytes)
+	// 視訊標頭 (12 bytes)：[codec:4][w:4][h:4]
 	vHeader := make([]byte, 12)
 	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
 		log.Fatal("read video header:", err)
 	}
 	codec := string(vHeader[:4])
-	width := binary.BigEndian.Uint32(vHeader[4:8])
-	height := binary.BigEndian.Uint32(vHeader[8:12])
-	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, width, height)
+	w0 := binary.BigEndian.Uint32(vHeader[4:8])
+	h0 := binary.BigEndian.Uint32(vHeader[8:12])
+
+	stateMu.Lock()
+	videoW, videoH = uint16(w0), uint16(h0) // 觸控封包用的 screen_size 初值
+	stateMu.Unlock()
+
+	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, w0, h0)
 
 	// 接收幀迴圈
-	meta := make([]byte, 12) // scrcpy: [pts(8)] + [size(4)]
+	meta := make([]byte, 12) // [pts(8)] + [size(4)]
 	startTime = time.Now()
 	var frameCount int
 	var totalBytes int64
@@ -153,23 +168,24 @@ func main() {
 		// 解析 Annex-B → NALUs，並快取 SPS/PPS、偵測是否含 IDR
 		nalus := splitAnnexBNALUs(frame)
 
-		// 統計這個 AU 的 NALU 組成
-		var cntSPS, cntPPS, cntIDR, cntNonIDR, cntSEI, cntAUD int
 		idrInThisAU := false
+		var gotNewSPS bool
 
 		for _, n := range nalus {
-			t := naluType(n)
-			switch t {
+			switch naluType(n) {
 			case 7: // SPS
-				cntSPS++
 				stateMu.Lock()
 				if !bytes.Equal(lastSPS, n) {
-					log.Printf("[AU] 更新 SPS (len=%d)", len(n))
+					// 嘗試從新 SPS 解析寬高
+					if w, h, ok := parseH264SPSDimensions(n); ok {
+						videoW, videoH = w, h
+						gotNewSPS = true
+						log.Printf("[AU] 更新 SPS 並套用解析度 %dx%d 給觸控映射", w, h)
+					}
 				}
 				lastSPS = append([]byte(nil), n...)
 				stateMu.Unlock()
 			case 8: // PPS
-				cntPPS++
 				stateMu.Lock()
 				if !bytes.Equal(lastPPS, n) {
 					log.Printf("[AU] 更新 PPS (len=%d)", len(n))
@@ -177,14 +193,7 @@ func main() {
 				lastPPS = append([]byte(nil), n...)
 				stateMu.Unlock()
 			case 5: // IDR
-				cntIDR++
 				idrInThisAU = true
-			case 1:
-				cntNonIDR++
-			case 6:
-				cntSEI++
-			case 9:
-				cntAUD++
 			}
 		}
 
@@ -197,6 +206,26 @@ func main() {
 
 		// 推進 WebRTC
 		if vt != nil && pk != nil {
+			// 如果剛換解析度，先把 SPS/PPS prepend，等待 IDR
+			if gotNewSPS {
+				stateMu.RLock()
+				sps := lastSPS
+				pps := lastPPS
+				stateMu.RUnlock()
+				if len(sps) > 0 {
+					sendNALUsAtTS(curTS, sps)
+				}
+				if len(pps) > 0 {
+					sendNALUsAtTS(curTS, pps)
+				}
+				// 確保拿到 IDR 再開始送
+				waitKF = true
+				stateMu.Lock()
+				needKeyframe = true
+				stateMu.Unlock()
+				requestKeyframe()
+			}
+
 			if waitKF {
 				stateMu.RLock()
 				sps := lastSPS
@@ -204,14 +233,11 @@ func main() {
 				stateMu.RUnlock()
 
 				if len(sps) > 0 && len(pps) > 0 {
-					log.Println("[KF] prepend SPS+PPS")
-					sendNALUsAtTS(curTS, sps, pps) // 同一 timestamp
+					sendNALUsAtTS(curTS, sps, pps)
 				} else {
-					log.Println("[KF] 尚未緩存到 SPS/PPS，重新請求關鍵幀")
 					requestKeyframe()
 				}
 
-				// 保險：每 30 幀再請一次（約 1 秒，假設 ~30fps）
 				framesSinceKF++
 				if framesSinceKF%30 == 0 {
 					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
@@ -219,7 +245,7 @@ func main() {
 				}
 
 				if !idrInThisAU {
-					goto stats // 這幀不送
+					goto stats
 				}
 
 				log.Println("[KF] 偵測到 IDR，開始送流")
@@ -228,9 +254,8 @@ func main() {
 				framesSinceKF = 0
 				stateMu.Unlock()
 
-				sendNALUAccessUnitAtTS(nalus, curTS) // 送這個含 IDR 的 AU
+				sendNALUAccessUnitAtTS(nalus, curTS)
 			} else {
-				// 正常持續送
 				sendNALUAccessUnitAtTS(nalus, curTS)
 			}
 		}
@@ -302,7 +327,19 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 讀 RTCP：解析並印出 PLI / FIR，並請求關鍵幀
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		log.Println("DataChannel:", dc.Label())
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			var ev touchEvent
+			if err := json.Unmarshal(msg.Data, &ev); err != nil {
+				log.Println("datachannel unmarshal:", err)
+				return
+			}
+			handleTouchEvent(ev)
+		})
+	})
+
+	// 讀 RTCP：解析 PLI / FIR，並請求關鍵幀
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
@@ -333,8 +370,6 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 					pliCount++
 					stateMu.Unlock()
 					requestKeyframe()
-				default:
-					// log.Printf("[RTCP] 其他封包: %T\n", pkt)
 				}
 			}
 		}
@@ -352,13 +387,11 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	// 設定 Remote SDP
+	// 設定 Remote SDP / 建立 Answer / 等待 ICE（非 trickle）
 	if err := pc.SetRemoteDescription(offer); err != nil {
 		http.Error(w, "set remote error", http.StatusInternalServerError)
 		return
 	}
-
-	// 建立 Answer
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
 		http.Error(w, "answer error", http.StatusInternalServerError)
@@ -368,23 +401,20 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "set local error", http.StatusInternalServerError)
 		return
 	}
-
-	// 等待 ICE 完成（不走 trickle，簡化）
-	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	<-gatherComplete
+	<-webrtc.GatheringCompletePromise(pc)
 
 	// 初始化發送端狀態
 	stateMu.Lock()
 	videoTrack = track
 	packetizer = rtp.NewPacketizer(
-		1200,                          // MTU
-		96,                            // Payload type
-		uint32(time.Now().UnixNano()), // SSRC（簡易）
+		1200,
+		96,
+		uint32(time.Now().UnixNano()),
 		&codecs.H264Payloader{},
 		rtp.NewRandomSequencer(),
 		90000,
 	)
-	needKeyframe = true // 新用戶入房：先送 SPS/PPS，再等 IDR
+	needKeyframe = true // 新用戶：先送 SPS/PPS，再等 IDR
 	auSeq = 0
 	havePTS0 = false
 	pts0 = 0
@@ -399,18 +429,121 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(pc.LocalDescription())
 }
 
-// requestKeyframe 要求 Android 重新送出關鍵幀
+// 要求 Android 重新送出關鍵幀
 func requestKeyframe() {
 	if controlConn == nil {
 		return
 	}
+	controlMu.Lock()
+	defer controlMu.Unlock()
 	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
 		log.Println("send RESET_VIDEO:", err)
 	}
 }
 
-// === RTP 發送（以指定 TS） ===
+type touchEvent struct {
+	Type     string  `json:"type"` // "down" | "up" | "move" | "cancel"
+	ID       uint64  `json:"id"`   // pointer id
+	X        int32   `json:"x"`
+	Y        int32   `json:"y"`
+	Width    uint16  `json:"width"`  // 來源端可傳，但我們忽略
+	Height   uint16  `json:"height"` // 來源端可傳，但我們忽略
+	Pressure float64 `json:"pressure"`
+	Buttons  uint32  `json:"buttons"`
+}
 
+func handleTouchEvent(ev touchEvent) {
+	if controlConn == nil {
+		return
+	}
+
+	var action uint8
+	var actionButton uint32
+
+	pointerMu.Lock()
+	prev := pointerButtons[ev.ID]
+	switch ev.Type {
+	case "down":
+		action = 0 // AMOTION_EVENT_ACTION_DOWN
+		actionButton = ev.Buttons &^ prev
+	case "up":
+		action = 1 // AMOTION_EVENT_ACTION_UP
+		actionButton = prev &^ ev.Buttons
+	case "move":
+		action = 2 // AMOTION_EVENT_ACTION_MOVE
+		actionButton = 0
+	case "cancel":
+		action = 3 // AMOTION_EVENT_ACTION_CANCEL
+		actionButton = 0
+	default:
+		action = 2
+		actionButton = 0
+	}
+	pointerButtons[ev.ID] = ev.Buttons
+	pointerMu.Unlock()
+
+	// 讀當前視訊寬高（觸控映射空間）
+	stateMu.RLock()
+	sw, sh := videoW, videoH
+	stateMu.RUnlock()
+
+	// 夾住座標，避免越界（保守處理）
+	if ev.X < 0 {
+		ev.X = 0
+	}
+	if ev.Y < 0 {
+		ev.Y = 0
+	}
+	if sw > 0 && sh > 0 {
+		if ev.X > int32(sw)-1 {
+			ev.X = int32(sw) - 1
+		}
+		if ev.Y > int32(sh)-1 {
+			ev.Y = int32(sh) - 1
+		}
+	}
+
+	// ====== 序列化（總長 32 bytes）======
+	buf := make([]byte, 32)
+	buf[0] = 2                                 // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
+	buf[1] = action                            // action
+	binary.BigEndian.PutUint64(buf[2:], ev.ID) // pointer_id (u64)
+
+	// position: x(int32), y(int32), w(u16), h(u16) — 大端序
+	binary.BigEndian.PutUint32(buf[10:], uint32(ev.X))
+	binary.BigEndian.PutUint32(buf[14:], uint32(ev.Y))
+	binary.BigEndian.PutUint16(buf[18:], sw)
+	binary.BigEndian.PutUint16(buf[20:], sh)
+
+	// pressure: 0..1 → u16 固定小數；UP 事件壓力歸 0
+	var p uint16
+	if action != 1 {
+		f := ev.Pressure
+		if f < 0 {
+			f = 0
+		} else if f > 1 {
+			f = 1
+		}
+		if f == 1 {
+			p = 0xffff
+		} else {
+			p = uint16(math.Round(f * 65535))
+		}
+	}
+	binary.BigEndian.PutUint16(buf[22:], p)
+
+	// action_button (u32) + buttons (u32)
+	binary.BigEndian.PutUint32(buf[24:], actionButton)
+	binary.BigEndian.PutUint32(buf[28:], ev.Buttons)
+
+	controlMu.Lock()
+	if _, err := controlConn.Write(buf); err != nil {
+		log.Println("send touch event:", err)
+	}
+	controlMu.Unlock()
+}
+
+// === RTP 發送（以指定 TS） ===
 func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
@@ -419,26 +552,13 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	if pk == nil || vt == nil || len(nalus) == 0 {
 		return
 	}
-
 	for i, n := range nalus {
 		if len(n) == 0 {
 			continue
 		}
 		pkts := pk.Packetize(n, ts)
-
-		// if verboseRTP {
-		// 	log.Printf("[AU #%d] RTPize NALU[%d/%d] %s len=%d → pkts=%d ts=%d",
-		// 		auSeq, i+1, len(nalus), h264NaluName(naluType(n)), len(n), len(pkts), ts)
-		// }
-
 		for j, p := range pkts {
-			// 僅最後一個 NALU 的最後一個 RTP 設 Marker=true
 			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
-
-			// if verboseRTP && p.Marker {
-			// 	log.Printf("[AU #%d] Marker=true at seq=%d ts=%d", auSeq, p.SequenceNumber, p.Timestamp)
-			// }
-
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
@@ -459,15 +579,8 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 			continue
 		}
 		pkts := pk.Packetize(n, ts)
-
-		if verboseRTP {
-			log.Printf("[AU #%d] PREPEND %s len=%d → pkts=%d ts=%d",
-				auSeq, h264NaluName(naluType(n)), len(n), len(pkts), ts)
-		}
-
 		for _, p := range pkts {
-			// 參數集不當作一個獨立 AU，統一不設 Marker
-			p.Marker = false
+			p.Marker = false // 參數集不當作獨立 AU
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
@@ -476,7 +589,6 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 }
 
 // === Annex-B 工具 ===
-
 func splitAnnexBNALUs(b []byte) [][]byte {
 	var nalus [][]byte
 	i := 0
@@ -525,8 +637,6 @@ func naluType(n []byte) uint8 {
 
 func h264NaluName(t uint8) string {
 	switch t {
-	// case 1:
-	// 	return "Non-IDR (P/B)"
 	case 5:
 		return "IDR"
 	case 6:
@@ -543,9 +653,270 @@ func h264NaluName(t uint8) string {
 }
 
 // === PTS → RTP TS 轉換 ===
-
 func rtpTSFromPTS(pts, base uint64) uint32 {
 	delta := pts - base
-	// 90kHz * 秒數；pts 單位為微秒
-	return uint32((delta * 90000) / ptsPerSecond)
+	return uint32((delta * 90000) / ptsPerSecond) // 90kHz * 秒數
+}
+
+// === H.264 SPS 解析寬高（極簡實作，足夠抓常見 4:2:0） ===
+func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
+	if len(nal) < 4 || (nal[0]&0x1F) != 7 {
+		return
+	}
+	// 去除 emulation prevention bytes（00 00 03 → 00 00）
+	rbsp := make([]byte, 0, len(nal)-1)
+	for i := 1; i < len(nal); i++ { // 跳過 NAL header
+		if i+2 < len(nal) && nal[i] == 0 && nal[i+1] == 0 && nal[i+2] == 3 {
+			rbsp = append(rbsp, 0, 0)
+			i += 2
+			continue
+		}
+		rbsp = append(rbsp, nal[i])
+	}
+	br := bitReader{b: rbsp}
+
+	// profile_idc, constraint_flags, level_idc
+	if !br.skip(8 + 8 + 8) {
+		return
+	}
+	// seq_parameter_set_id
+	if _, ok2 := br.ue(); !ok2 {
+		return
+	}
+
+	// 一些 profile 會帶 chroma_format_idc
+	var chromaFormatIDC uint = 1 // 預設 4:2:0
+	profileIDC := rbsp[0]
+	if profileIDC == 100 || profileIDC == 110 || profileIDC == 122 ||
+		profileIDC == 244 || profileIDC == 44 || profileIDC == 83 ||
+		profileIDC == 86 || profileIDC == 118 || profileIDC == 128 ||
+		profileIDC == 138 || profileIDC == 139 || profileIDC == 134 {
+		if v, ok2 := br.ue(); !ok2 {
+			return
+		} else {
+			chromaFormatIDC = v
+		}
+		if chromaFormatIDC == 3 {
+			if _, ok2 := br.u(1); !ok2 { // separate_colour_plane_flag
+				return
+			}
+		}
+		// bit_depth_luma_minus8, bit_depth_chroma_minus8, qpprime_y_zero_transform_bypass_flag
+		if _, ok2 := br.ue(); !ok2 {
+			return
+		}
+		if _, ok2 := br.ue(); !ok2 {
+			return
+		}
+		if !br.skip(1) {
+			return
+		}
+		// seq_scaling_matrix_present_flag
+		if f, ok2 := br.u(1); !ok2 {
+			return
+		} else if f == 1 {
+			// 略過 scaling_list
+			n := 8
+			if chromaFormatIDC == 3 {
+				n = 12
+			}
+			for i := 0; i < n; i++ {
+				if g, ok3 := br.u(1); !ok3 {
+					return
+				} else if g == 1 {
+					// 略過 scaling_list 內容（簡化: 粗略跳過）
+					size := 16
+					if i >= 6 {
+						size = 64
+					}
+					lastScale := 8
+					nextScale := 8
+					for j := 0; j < size; j++ {
+						if nextScale != 0 {
+							delta, ok4 := br.se()
+							if !ok4 {
+								return
+							}
+							nextScale = (lastScale + int(delta) + 256) % 256
+						}
+						if nextScale != 0 {
+							lastScale = nextScale
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// log2_max_frame_num_minus4
+	if _, ok2 := br.ue(); !ok2 {
+		return
+	}
+	// pic_order_cnt_type
+	pct, ok2 := br.ue()
+	if !ok2 {
+		return
+	}
+	if pct == 0 {
+		if _, ok2 = br.ue(); !ok2 { // log2_max_pic_order_cnt_lsb_minus4
+			return
+		}
+	} else if pct == 1 {
+		if !br.skip(1) { // delta_pic_order_always_zero_flag
+			return
+		}
+		if _, ok2 = br.se(); !ok2 {
+			return
+		}
+		if _, ok2 = br.se(); !ok2 {
+			return
+		}
+		var n uint
+		if n, ok2 = br.ue(); !ok2 {
+			return
+		}
+		for i := uint(0); i < n; i++ {
+			if _, ok2 = br.se(); !ok2 {
+				return
+			}
+		}
+	}
+
+	// num_ref_frames, gaps_in_frame_num_value_allowed_flag
+	if _, ok2 = br.ue(); !ok2 {
+		return
+	}
+	if !br.skip(1) {
+		return
+	}
+
+	// 寬高
+	pwMinus1, ok2 := br.ue()
+	if !ok2 {
+		return
+	}
+	phMinus1, ok2 := br.ue()
+	if !ok2 {
+		return
+	}
+	frameMbsOnlyFlag, ok2 := br.u(1)
+	if !ok2 {
+		return
+	}
+	if frameMbsOnlyFlag == 0 {
+		if !br.skip(1) { // mb_adaptive_frame_field_flag
+			return
+		}
+	}
+	if !br.skip(1) { // direct_8x8_inference_flag
+		return
+	}
+
+	// cropping
+	cropLeft, cropRight, cropTop, cropBottom := uint(0), uint(0), uint(0), uint(0)
+	fcrop, ok2 := br.u(1)
+	if !ok2 {
+		return
+	}
+	if fcrop == 1 {
+		if cropLeft, ok2 = br.ue(); !ok2 {
+			return
+		}
+		if cropRight, ok2 = br.ue(); !ok2 {
+			return
+		}
+		if cropTop, ok2 = br.ue(); !ok2 {
+			return
+		}
+		if cropBottom, ok2 = br.ue(); !ok2 {
+			return
+		}
+	}
+
+	mbWidth := (pwMinus1 + 1)
+	mbHeight := (phMinus1 + 1) * (2 - frameMbsOnlyFlag)
+
+	// 計算 crop 單位
+	var subW, subH uint = 1, 1
+	switch chromaFormatIDC {
+	case 0: // monochrome
+		subW, subH = 1, 1
+	case 1: // 4:2:0
+		subW, subH = 2, 2
+	case 2: // 4:2:2
+		subW, subH = 2, 1
+	case 3: // 4:4:4
+		subW, subH = 1, 1
+	}
+	cropUnitX := subW
+	cropUnitY := subH * (2 - frameMbsOnlyFlag)
+
+	width := int(mbWidth*16) - int((cropLeft+cropRight)*cropUnitX)
+	height := int(mbHeight*16) - int((cropTop+cropBottom)*cropUnitY)
+
+	if width <= 0 || height <= 0 || width > 65535 || height > 65535 {
+		return
+	}
+	return uint16(width), uint16(height), true
+}
+
+// --- 極簡 bit reader ---
+type bitReader struct {
+	b []byte
+	i int // bit index
+}
+
+func (br *bitReader) u(n int) (uint, bool) {
+	if n <= 0 {
+		return 0, true
+	}
+	var v uint
+	for k := 0; k < n; k++ {
+		byteIndex := br.i / 8
+		if byteIndex >= len(br.b) {
+			return 0, false
+		}
+		bitIndex := 7 - (br.i % 8)
+		bit := (br.b[byteIndex] >> uint(bitIndex)) & 1
+		v = (v << 1) | uint(bit)
+		br.i++
+	}
+	return v, true
+}
+func (br *bitReader) skip(n int) bool {
+	_, ok := br.u(n)
+	return ok
+}
+func (br *bitReader) ue() (uint, bool) {
+	var leadingZeros int
+	for {
+		b, ok := br.u(1)
+		if !ok {
+			return 0, false
+		}
+		if b == 0 {
+			leadingZeros++
+		} else {
+			break
+		}
+	}
+	if leadingZeros == 0 {
+		return 0, true
+	}
+	val, ok := br.u(leadingZeros)
+	if !ok {
+		return 0, false
+	}
+	return (1 << leadingZeros) - 1 + val, true
+}
+func (br *bitReader) se() (int, bool) {
+	uev, ok := br.ue()
+	if !ok {
+		return 0, false
+	}
+	k := int(uev)
+	if k%2 == 0 {
+		return -k / 2, true
+	}
+	return (k + 1) / 2, true
 }

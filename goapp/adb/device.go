@@ -9,6 +9,12 @@ import (
 	"os/exec"
 )
 
+// ScrcpyPort is the TCP port used by scrcpy for both video and control
+// channels. The Android server connects twice to this port: the first
+// connection carries the H.264 stream, the second is the control socket
+// for input events.
+const ScrcpyPort = 27183
+
 // Device 代表一台 Android 裝置
 type Device struct {
 	serial string
@@ -60,7 +66,7 @@ type ServerConn struct {
 
 // StartServer 透過 adb shell 啟動 scrcpy 伺服器並回傳視訊串流和控制通道
 func (d *Device) StartServer() (*ServerConn, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:27183")
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ScrcpyPort))
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}

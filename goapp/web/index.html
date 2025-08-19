@@ -57,6 +57,7 @@
     const videoEl = $("#video");
     const BLOCK_KEYS = [" ", "k", "MediaPlayPause"];
     let forceStop = false;
+    let dc; // DataChannel for control
 
     // 永久關閉任何播放控制與菜單
     videoEl.controls = false;
@@ -83,9 +84,21 @@
       return { x, y, w: r.width, h: r.height };
     }
     function sendTouch(type, e) {
-      const p = normPoint(e);
-      // TODO: 在這裡把事件送到後端（例如 POST /control）
-      log(`touch:${type}`, { id: e.pointerId, x: +p.x.toFixed(4), y: +p.y.toFixed(4), b: e.buttons||0, pr: e.pressure||0 });
+      const r = videoEl.getBoundingClientRect();
+      const payload = {
+        type,
+        id: e.pointerId,
+        x: Math.round(e.clientX - r.left),
+        y: Math.round(e.clientY - r.top),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+        pressure: e.pressure || 0,
+        buttons: e.buttons || 0,
+      };
+      if (dc && dc.readyState === "open") {
+        dc.send(JSON.stringify(payload));
+      }
+      log(`touch:${type}`, payload);
     }
     videoEl.addEventListener("pointerdown", (e) => {
       videoEl.setPointerCapture?.(e.pointerId);
@@ -126,6 +139,9 @@
         forceStop = false;
 
         pc = new RTCPeerConnection();
+        dc = pc.createDataChannel("control");
+        dc.onopen = () => log("DataChannel open");
+        dc.onclose = () => log("DataChannel closed");
 
         // 顯示遠端影像
         pc.ontrack = (e) => {
