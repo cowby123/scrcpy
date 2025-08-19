@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -66,13 +65,6 @@ func main() {
 	defer conn.Control.Close()
 	controlConn = conn.Control
 
-	// 建立輸出檔案 (debug 用)
-	outFile, err := os.Create("output.h264")
-	if err != nil {
-		log.Fatal("create output file:", err)
-	}
-	defer outFile.Close()
-
 	log.Println("開始接收視訊串流，並輸出到 output.h264")
 
 	// 跳過裝置名稱 (64 bytes)
@@ -111,12 +103,6 @@ func main() {
 		frame := make([]byte, frameSize)
 		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
 			log.Println("read frame:", err)
-			break
-		}
-
-		// 存檔 (debug)
-		if _, err := outFile.Write(frame); err != nil {
-			log.Println("write file error:", err)
 			break
 		}
 
