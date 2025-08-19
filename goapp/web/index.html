@@ -8,7 +8,18 @@
     :root { color-scheme: dark; }
     body { margin:0; background:#111; display:flex; gap:16px; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; font-family:ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial; }
     header { color:#ddd; opacity:.9; }
-    video { width:min(92vw, 900px); max-height:80vh; background:black; border-radius:12px; box-shadow:0 6px 30px rgba(0,0,0,.35); }
+    video {
+      width:min(92vw, 900px);
+      max-height:80vh;
+      background:black;
+      border-radius:12px;
+      box-shadow:0 6px 30px rgba(0,0,0,.35);
+      /* 為了能接收原始多指觸控/手勢，交給 JS 處理 */
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
     .row { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
     button { padding:10px 16px; border-radius:10px; border:1px solid #333; background:#1f1f1f; color:#ddd; cursor:pointer; }
     button:hover { background:#262626; }
@@ -20,7 +31,11 @@
     <h2>scrcpy WebRTC Demo</h2>
   </header>
 
-  <video id="video" autoplay playsinline controls muted></video>
+  <!-- 拿掉 controls，並封鎖 PiP/Cast/倍速/全螢幕 -->
+  <video id="video" autoplay playsinline muted
+         disablepictureinpicture
+         disableremoteplayback
+         controlslist="nodownload noplaybackrate noremoteplayback nofullscreen"></video>
 
   <div class="row">
     <button id="btnStart">開始連線</button>
@@ -39,6 +54,57 @@
     };
 
     let pc;
+    const videoEl = $("#video");
+    const BLOCK_KEYS = [" ", "k", "MediaPlayPause"];
+    let forceStop = false;
+
+    // 永久關閉任何播放控制與菜單
+    videoEl.controls = false;
+    videoEl.setAttribute("disablepictureinpicture", "");
+    videoEl.setAttribute("disableremoteplayback", "");
+    videoEl.setAttribute("controlslist", "nodownload noplaybackrate noremoteplayback nofullscreen");
+    videoEl.addEventListener("contextmenu", e => e.preventDefault());
+    // 阻止點擊/雙擊造成全螢幕或暫停
+    ["click","dblclick"].forEach(type => videoEl.addEventListener(type, e => e.preventDefault(), { capture:true }));
+
+    // 若外部嘗試暫停，立刻恢復播放（除非是我們主動 stop）
+    videoEl.addEventListener("pause", () => { if (!forceStop) videoEl.play().catch(()=>{}); });
+
+    // 阻擋鍵盤的播放/暫停快捷鍵
+    window.addEventListener("keydown", (e) => {
+      if (BLOCK_KEYS.includes(e.key)) e.preventDefault();
+    }, { capture: true });
+
+    // ===== 觸控/指針事件骨架（保留互動，不影響未來傳 ADB） =====
+    function normPoint(e) {
+      const r = videoEl.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width;
+      const y = (e.clientY - r.top) / r.height;
+      return { x, y, w: r.width, h: r.height };
+    }
+    function sendTouch(type, e) {
+      const p = normPoint(e);
+      // TODO: 在這裡把事件送到後端（例如 POST /control）
+      log(`touch:${type}`, { id: e.pointerId, x: +p.x.toFixed(4), y: +p.y.toFixed(4), b: e.buttons||0, pr: e.pressure||0 });
+    }
+    videoEl.addEventListener("pointerdown", (e) => {
+      videoEl.setPointerCapture?.(e.pointerId);
+      sendTouch("down", e);
+      e.preventDefault();
+    }, { passive:false });
+    videoEl.addEventListener("pointermove", (e) => {
+      if (e.pressure !== 0 || e.buttons) sendTouch("move", e);
+      e.preventDefault();
+    }, { passive:false });
+    videoEl.addEventListener("pointerup", (e) => {
+      sendTouch("up", e);
+      e.preventDefault();
+    }, { passive:false });
+    videoEl.addEventListener("pointercancel", (e) => {
+      sendTouch("cancel", e);
+      e.preventDefault();
+    }, { passive:false });
+    // ======================================================
 
     function waitForIceComplete(pc) {
       return new Promise(resolve => {
@@ -57,14 +123,16 @@
       try {
         $("#btnStart").disabled = true;
         $("#btnStop").disabled = false;
+        forceStop = false;
 
         pc = new RTCPeerConnection();
 
         // 顯示遠端影像
-        const videoEl = $("#video");
         pc.ontrack = (e) => {
           if (!videoEl.srcObject) {
             videoEl.srcObject = e.streams[0];
+            // 某些瀏覽器需要顯式 play()
+            videoEl.play().catch(()=>{});
           }
         };
 
@@ -113,6 +181,7 @@
     async function stop() {
       try {
         $("#btnStop").disabled = true;
+        forceStop = true; // 防止 pause 事件自動恢復播放
         if (pc) {
           pc.getTransceivers().forEach(t => t.stop && t.stop());
           pc.getSenders().forEach(s => s.track && s.track.stop());
@@ -120,7 +189,6 @@
           pc.close();
           pc = null;
         }
-        const videoEl = $("#video");
         if (videoEl.srcObject) {
           videoEl.srcObject.getTracks().forEach(t => t.stop());
           videoEl.srcObject = null;

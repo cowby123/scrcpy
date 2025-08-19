@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
@@ -19,31 +21,49 @@ import (
 
 const controlMsgResetVideo = 17
 
+// 假設 scrcpy 的 PTS 單位為「微秒」
+const ptsPerSecond = uint64(1_000_000) // 1e6
+
 // === 全域狀態 ===
 var (
 	videoTrack   *webrtc.TrackLocalStaticRTP
 	peerConn     *webrtc.PeerConnection
 	packetizer   rtp.Packetizer
-	rtpTS        uint32 // 90kHz 時基
-	needKeyframe bool   // 新用戶/PLI 時需要 SPS/PPS + IDR
-	lastSPS      []byte
-	lastPPS      []byte
-	stateMu      sync.RWMutex
+	needKeyframe bool // 新用戶/PLI 時需要 SPS/PPS + IDR
 
-	startTime   time.Time // 只用來印速率統計
+	// H.264 參數集快取
+	lastSPS []byte
+	lastPPS []byte
+
+	stateMu sync.RWMutex
+
+	startTime   time.Time // 速率統計
 	controlConn io.Writer // 與 Android 控制通道
+
+	// 觀測 PLI/FIR 與 AU 序號、RTP 詳細列印
+	lastPLI       time.Time
+	pliCount      int
+	framesSinceKF int
+	auSeq         uint64
+	verboseRTP    = true // 設 true 會列印每個 NALU 的 RTP 切片與 Marker
+
+	// PTS → RTP Timestamp 映射
+	havePTS0 bool
+	pts0     uint64
+	rtpTS0   uint32 // 可為 0；保留擴充空間（若要做 offset）
 )
 
 func main() {
-	// 靜態檔案伺服器 (提供 web/index.html)
+	// 路由註冊
 	fs := http.FileServer(http.Dir("./web"))
 	http.Handle("/", fs)
-
-	// WebRTC SDP handler
 	http.HandleFunc("/offer", handleOffer)
+
+	// 啟動 HTTP（簡化）
 	go func() {
 		log.Println("HTTP 伺服器: http://localhost:8080/  (SDP: POST /offer)")
-		log.Fatal(http.ListenAndServe(":8080", nil))
+		srv := &http.Server{Addr: ":8080"}
+		log.Fatal(srv.ListenAndServe())
 	}()
 
 	// 連線到第一台 Android 裝置
@@ -65,7 +85,22 @@ func main() {
 	defer conn.Control.Close()
 	controlConn = conn.Control
 
-	log.Println("開始接收視訊串流，並輸出到 output.h264")
+	// ===== 每 5 秒固定請求一次關鍵幀 =====
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			stateMu.Lock()
+			needKeyframe = true // 讓送流路徑在下一個 IDR 前 prepend SPS/PPS
+			stateMu.Unlock()
+
+			log.Println("[KF] 週期性請求關鍵幀 (每 5 秒)")
+			requestKeyframe()
+		}
+	}()
+	// =================================
+
+	log.Println("開始接收視訊串流（已停用磁碟寫入）")
 
 	// 跳過裝置名稱 (64 bytes)
 	nameBuf := make([]byte, 64)
@@ -97,7 +132,16 @@ func main() {
 			log.Println("read frame meta:", err)
 			break
 		}
+		pts := binary.BigEndian.Uint64(meta[0:8])
 		frameSize := binary.BigEndian.Uint32(meta[8:12])
+
+		// 初始化 PTS 基準
+		if !havePTS0 {
+			pts0 = pts
+			rtpTS0 = 0
+			havePTS0 = true
+		}
+		curTS := rtpTS0 + rtpTSFromPTS(pts, pts0)
 
 		// frame data
 		frame := make([]byte, frameSize)
@@ -108,50 +152,86 @@ func main() {
 
 		// 解析 Annex-B → NALUs，並快取 SPS/PPS、偵測是否含 IDR
 		nalus := splitAnnexBNALUs(frame)
+
+		// 統計這個 AU 的 NALU 組成
+		var cntSPS, cntPPS, cntIDR, cntNonIDR, cntSEI, cntAUD int
 		idrInThisAU := false
+
 		for _, n := range nalus {
-			switch naluType(n) {
+			t := naluType(n)
+			switch t {
 			case 7: // SPS
+				cntSPS++
 				stateMu.Lock()
+				if !bytes.Equal(lastSPS, n) {
+					log.Printf("[AU] 更新 SPS (len=%d)", len(n))
+				}
 				lastSPS = append([]byte(nil), n...)
 				stateMu.Unlock()
 			case 8: // PPS
+				cntPPS++
 				stateMu.Lock()
+				if !bytes.Equal(lastPPS, n) {
+					log.Printf("[AU] 更新 PPS (len=%d)", len(n))
+				}
 				lastPPS = append([]byte(nil), n...)
 				stateMu.Unlock()
 			case 5: // IDR
+				cntIDR++
 				idrInThisAU = true
+			case 1:
+				cntNonIDR++
+			case 6:
+				cntSEI++
+			case 9:
+				cntAUD++
 			}
 		}
 
-		// 推進 WebRTC
+		// 讀取目前狀態（列印時用）
 		stateMu.RLock()
 		vt := videoTrack
 		pk := packetizer
 		waitKF := needKeyframe
 		stateMu.RUnlock()
 
+		// 推進 WebRTC
 		if vt != nil && pk != nil {
 			if waitKF {
-				// 先送參數集 (不前進 timestamp)
 				stateMu.RLock()
 				sps := lastSPS
 				pps := lastPPS
 				stateMu.RUnlock()
+
 				if len(sps) > 0 && len(pps) > 0 {
-					sendNALUs(sps, pps) // 同一 timestamp
+					log.Println("[KF] prepend SPS+PPS")
+					sendNALUsAtTS(curTS, sps, pps) // 同一 timestamp
+				} else {
+					log.Println("[KF] 尚未緩存到 SPS/PPS，重新請求關鍵幀")
+					requestKeyframe()
 				}
-				// 等 IDR 才開流
+
+				// 保險：每 30 幀再請一次（約 1 秒，假設 ~30fps）
+				framesSinceKF++
+				if framesSinceKF%30 == 0 {
+					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
+					requestKeyframe()
+				}
+
 				if !idrInThisAU {
 					goto stats // 這幀不送
 				}
+
+				log.Println("[KF] 偵測到 IDR，開始送流")
 				stateMu.Lock()
 				needKeyframe = false
+				framesSinceKF = 0
 				stateMu.Unlock()
-				sendNALUAccessUnit(nalus) // 送這個含 IDR 的 AU，送完 +TS
+
+				sendNALUAccessUnitAtTS(nalus, curTS) // 送這個含 IDR 的 AU
 			} else {
 				// 正常持續送
-				sendNALUAccessUnit(nalus)
+				sendNALUAccessUnitAtTS(nalus, curTS)
 			}
 		}
 
@@ -161,9 +241,18 @@ func main() {
 		if frameCount%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			bytesPerSecond := float64(totalBytes) / elapsed
-			log.Printf("接收影格: %d, 速率: %.2f MB/s\n",
-				frameCount, bytesPerSecond/(1024*1024))
+			stateMu.RLock()
+			lp := lastPLI
+			pc := pliCount
+			stateMu.RUnlock()
+			log.Printf("接收影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s)",
+				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339))
 		}
+
+		// 下一 AU 序號
+		stateMu.Lock()
+		auSeq++
+		stateMu.Unlock()
 	}
 }
 
@@ -213,15 +302,41 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 讀 RTCP（可擴充：偵測 PLI/FIR → needKeyframe=true）
+	// 讀 RTCP：解析並印出 PLI / FIR，並請求關鍵幀
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
-			if _, _, err := sender.Read(rtcpBuf); err != nil {
+			n, _, err := sender.Read(rtcpBuf)
+			if err != nil {
 				return
 			}
-			// 簡化：不解析內容；你可改成解析 PLI/FIR 後：
-			// stateMu.Lock(); needKeyframe = true; stateMu.Unlock()
+			pkts, err := rtcp.Unmarshal(rtcpBuf[:n])
+			if err != nil {
+				log.Println("RTCP unmarshal error:", err)
+				continue
+			}
+			for _, pkt := range pkts {
+				switch p := pkt.(type) {
+				case *rtcp.PictureLossIndication:
+					log.Println("[RTCP] 收到 PLI → needKeyframe = true")
+					stateMu.Lock()
+					needKeyframe = true
+					lastPLI = time.Now()
+					pliCount++
+					stateMu.Unlock()
+					requestKeyframe()
+				case *rtcp.FullIntraRequest:
+					log.Printf("[RTCP] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", p.SenderSSRC, p.MediaSSRC)
+					stateMu.Lock()
+					needKeyframe = true
+					lastPLI = time.Now()
+					pliCount++
+					stateMu.Unlock()
+					requestKeyframe()
+				default:
+					// log.Printf("[RTCP] 其他封包: %T\n", pkt)
+				}
+			}
 		}
 	}()
 
@@ -261,17 +376,19 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	// 初始化發送端狀態
 	stateMu.Lock()
 	videoTrack = track
-	// 隨機 SSRC（簡化用時間來源），時基 90kHz
 	packetizer = rtp.NewPacketizer(
 		1200,                          // MTU
 		96,                            // Payload type
-		uint32(time.Now().UnixNano()), // SSRC
+		uint32(time.Now().UnixNano()), // SSRC（簡易）
 		&codecs.H264Payloader{},
 		rtp.NewRandomSequencer(),
 		90000,
 	)
-	rtpTS = 0
 	needKeyframe = true // 新用戶入房：先送 SPS/PPS，再等 IDR
+	auSeq = 0
+	havePTS0 = false
+	pts0 = 0
+	rtpTS0 = 0
 	stateMu.Unlock()
 
 	// 請求 Android 立刻送出關鍵幀
@@ -292,41 +409,47 @@ func requestKeyframe() {
 	}
 }
 
-// === Annex-B 工具與發送 ===
+// === RTP 發送（以指定 TS） ===
 
-// 把一個 Access Unit 的 NALUs 一次送完，最後一個 RTP 設 marker，送完再 +TS
-func sendNALUAccessUnit(nalus [][]byte) {
+func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
 	vt := videoTrack
-	ts := rtpTS
 	stateMu.RUnlock()
 	if pk == nil || vt == nil || len(nalus) == 0 {
 		return
 	}
 
 	for i, n := range nalus {
+		if len(n) == 0 {
+			continue
+		}
 		pkts := pk.Packetize(n, ts)
+
+		// if verboseRTP {
+		// 	log.Printf("[AU #%d] RTPize NALU[%d/%d] %s len=%d → pkts=%d ts=%d",
+		// 		auSeq, i+1, len(nalus), h264NaluName(naluType(n)), len(n), len(pkts), ts)
+		// }
+
 		for j, p := range pkts {
 			// 僅最後一個 NALU 的最後一個 RTP 設 Marker=true
 			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
+
+			// if verboseRTP && p.Marker {
+			// 	log.Printf("[AU #%d] Marker=true at seq=%d ts=%d", auSeq, p.SequenceNumber, p.Timestamp)
+			// }
+
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
 		}
 	}
-	// 每幀 30fps → 90kHz/30 = 3000
-	stateMu.Lock()
-	rtpTS += 3000
-	stateMu.Unlock()
 }
 
-// 只送參數集（同一 timestamp，不遞增）
-func sendNALUs(nalus ...[]byte) {
+func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 	stateMu.RLock()
 	pk := packetizer
 	vt := videoTrack
-	ts := rtpTS
 	stateMu.RUnlock()
 	if pk == nil || vt == nil {
 		return
@@ -336,11 +459,15 @@ func sendNALUs(nalus ...[]byte) {
 			continue
 		}
 		pkts := pk.Packetize(n, ts)
+
+		if verboseRTP {
+			log.Printf("[AU #%d] PREPEND %s len=%d → pkts=%d ts=%d",
+				auSeq, h264NaluName(naluType(n)), len(n), len(pkts), ts)
+		}
+
 		for _, p := range pkts {
 			// 參數集不當作一個獨立 AU，統一不設 Marker
 			p.Marker = false
-			// 若你要把 SPS/PPS 視為一個 AU，也可在最後一包設 true：
-			// p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
@@ -348,7 +475,8 @@ func sendNALUs(nalus ...[]byte) {
 	}
 }
 
-// 解析 Annex-B → 去除 start code 的 NALUs
+// === Annex-B 工具 ===
+
 func splitAnnexBNALUs(b []byte) [][]byte {
 	var nalus [][]byte
 	i := 0
@@ -359,7 +487,6 @@ func splitAnnexBNALUs(b []byte) [][]byte {
 		}
 		nextStart, _ := findStartCode(b, scEnd)
 		if nextStart < 0 {
-			// 最後一個 NALU
 			n := b[scEnd:]
 			if len(n) > 0 {
 				nalus = append(nalus, n)
@@ -394,4 +521,31 @@ func naluType(n []byte) uint8 {
 		return 0
 	}
 	return n[0] & 0x1F
+}
+
+func h264NaluName(t uint8) string {
+	switch t {
+	// case 1:
+	// 	return "Non-IDR (P/B)"
+	case 5:
+		return "IDR"
+	case 6:
+		return "SEI"
+	case 7:
+		return "SPS"
+	case 8:
+		return "PPS"
+	case 9:
+		return "AUD"
+	default:
+		return fmt.Sprintf("type=%d", t)
+	}
+}
+
+// === PTS → RTP TS 轉換 ===
+
+func rtpTSFromPTS(pts, base uint64) uint32 {
+	delta := pts - base
+	// 90kHz * 秒數；pts 單位為微秒
+	return uint32((delta * 90000) / ptsPerSecond)
 }
