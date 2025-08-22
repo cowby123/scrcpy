@@ -40,7 +40,7 @@ var (
 	controlConn io.ReadWriter
 	controlMu   sync.Mutex
 
-	// 觀測 PLI/FIR 與 AU 序號、RTP 詳細列印
+	// 觀測 PLI/FIR 與 AU 序號
 	lastPLI       time.Time
 	pliCount      int
 	framesSinceKF int
@@ -92,7 +92,7 @@ func main() {
 	defer conn.Control.Close()
 	controlConn = conn.Control
 
-	// 重要：把控制通道讀掉，避免堆積阻塞
+	// 把控制通道讀掉，避免堆積阻塞
 	go func(r io.Reader) {
 		_, _ = io.Copy(io.Discard, r)
 	}(conn.Control)
@@ -121,11 +121,13 @@ func main() {
 	log.Printf("裝置名稱: %s\n", deviceName)
 
 	// 視訊標頭 (12 bytes)：[codec:4][w:4][h:4]
+	// 視訊標頭 (12 bytes)：[codecID(u32)][w(u32)][h(u32)]
+	// FIX: 依 scrcpy 規格，這裡是 3 個 u32，而不是 ASCII "h264"
 	vHeader := make([]byte, 12)
 	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
 		log.Fatal("read video header:", err)
 	}
-	codec := string(vHeader[:4])
+	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（依版本可能不同，僅作參考）
 	w0 := binary.BigEndian.Uint32(vHeader[4:8])
 	h0 := binary.BigEndian.Uint32(vHeader[8:12])
 
@@ -133,10 +135,11 @@ func main() {
 	videoW, videoH = uint16(w0), uint16(h0) // 觸控封包用的 screen_size 初值
 	stateMu.Unlock()
 
-	log.Printf("編碼格式: %s, 解析度: %dx%d\n", codec, w0, h0)
+	log.Printf("編碼ID: %d, 解析度: %dx%d\n", codecID, w0, h0)
 
 	// 接收幀迴圈
-	meta := make([]byte, 12) // [pts(8)] + [size(4)]
+	// 多數版本下 frame meta 是 12 bytes：[PTS(u64)] + [size(u32)]
+	meta := make([]byte, 12)
 	startTime = time.Now()
 	var frameCount int
 	var totalBytes int64
@@ -504,6 +507,7 @@ func handleTouchEvent(ev touchEvent) {
 	}
 
 	// ====== 序列化（總長 32 bytes）======
+	// 注意：不同 scrcpy 版本控制訊息格式可能不同，這裡以常見版本為準
 	buf := make([]byte, 32)
 	buf[0] = 2                                 // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
 	buf[1] = action                            // action
@@ -544,6 +548,9 @@ func handleTouchEvent(ev touchEvent) {
 }
 
 // === RTP 發送（以指定 TS） ===
+// FIX: Packetizer 的 Packetize 第二參數是「samples（累加量）」不是「timestamp」
+//
+//	我們改為 samples=0，並手動覆寫每個封包的 p.Timestamp=ts，確保同一幀所有封包 timestamp 一致
 func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
@@ -556,9 +563,10 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 		if len(n) == 0 {
 			continue
 		}
-		pkts := pk.Packetize(n, ts)
+		pkts := pk.Packetize(n, 0) // FIX: samples=0，不讓內部累加
 		for j, p := range pkts {
-			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
+			p.Timestamp = ts                                     // FIX: 覆寫 timestamp
+			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1) // AU 最末封包設 Marker
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
@@ -578,8 +586,9 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 		if len(n) == 0 {
 			continue
 		}
-		pkts := pk.Packetize(n, ts)
+		pkts := pk.Packetize(n, 0) // FIX: samples=0
 		for _, p := range pkts {
+			p.Timestamp = ts // FIX: 覆寫 timestamp
 			p.Marker = false // 參數集不當作獨立 AU
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
