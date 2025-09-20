@@ -21,14 +21,14 @@ import (
 )
 
 const controlMsgResetVideo = 17
-const ptsPerSecond = uint64(1_000_000) // scrcpy PTS 單位：微秒
+const ptsPerSecond = uint64(1_000_000) // scrcpy PTS: microseconds
 
 // === 全域狀態 ===
 var (
 	videoTrack   *webrtc.TrackLocalStaticRTP
 	peerConn     *webrtc.PeerConnection
 	packetizer   rtp.Packetizer
-	needKeyframe bool // 新用戶/PLI 時需要 SPS/PPS + IDR
+	needKeyframe bool // 新用戶/PLI 需 SPS/PPS+IDR
 
 	// H.264 參數集快取
 	lastSPS []byte
@@ -93,11 +93,9 @@ func main() {
 	controlConn = conn.Control
 
 	// 把控制通道讀掉，避免堆積阻塞
-	go func(r io.Reader) {
-		_, _ = io.Copy(io.Discard, r)
-	}(conn.Control)
+	go func(r io.Reader) { _, _ = io.Copy(io.Discard, r) }(conn.Control)
 
-	// 週期性請求關鍵幀（可依需求調整或移除）
+	// 週期性請求關鍵幀（可依需求微調）
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -120,26 +118,23 @@ func main() {
 	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
 	log.Printf("裝置名稱: %s\n", deviceName)
 
-	// 視訊標頭 (12 bytes)：[codec:4][w:4][h:4]
 	// 視訊標頭 (12 bytes)：[codecID(u32)][w(u32)][h(u32)]
-	// FIX: 依 scrcpy 規格，這裡是 3 個 u32，而不是 ASCII "h264"
 	vHeader := make([]byte, 12)
 	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
 		log.Fatal("read video header:", err)
 	}
-	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（依版本可能不同，僅作參考）
+	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（版本可能不同）
 	w0 := binary.BigEndian.Uint32(vHeader[4:8])
 	h0 := binary.BigEndian.Uint32(vHeader[8:12])
 
 	stateMu.Lock()
-	videoW, videoH = uint16(w0), uint16(h0) // 觸控封包用的 screen_size 初值
+	videoW, videoH = uint16(w0), uint16(h0)
 	stateMu.Unlock()
 
 	log.Printf("編碼ID: %d, 解析度: %dx%d\n", codecID, w0, h0)
 
-	// 接收幀迴圈
-	// 多數版本下 frame meta 是 12 bytes：[PTS(u64)] + [size(u32)]
-	meta := make([]byte, 12)
+	// 接收幀
+	meta := make([]byte, 12) // [PTS(u64)] + [size(u32)]
 	startTime = time.Now()
 	var frameCount int
 	var totalBytes int64
@@ -168,7 +163,7 @@ func main() {
 			break
 		}
 
-		// 解析 Annex-B → NALUs，並快取 SPS/PPS、偵測是否含 IDR
+		// 解析 Annex-B → NALUs，並快取 SPS/PPS、偵測 IDR
 		nalus := splitAnnexBNALUs(frame)
 
 		idrInThisAU := false
@@ -179,7 +174,6 @@ func main() {
 			case 7: // SPS
 				stateMu.Lock()
 				if !bytes.Equal(lastSPS, n) {
-					// 嘗試從新 SPS 解析寬高
 					if w, h, ok := parseH264SPSDimensions(n); ok {
 						videoW, videoH = w, h
 						gotNewSPS = true
@@ -200,7 +194,7 @@ func main() {
 			}
 		}
 
-		// 讀取目前狀態（列印時用）
+		// 讀狀態
 		stateMu.RLock()
 		vt := videoTrack
 		pk := packetizer
@@ -209,7 +203,6 @@ func main() {
 
 		// 推進 WebRTC
 		if vt != nil && pk != nil {
-			// 如果剛換解析度，先把 SPS/PPS prepend，等待 IDR
 			if gotNewSPS {
 				stateMu.RLock()
 				sps := lastSPS
@@ -221,7 +214,7 @@ func main() {
 				if len(pps) > 0 {
 					sendNALUsAtTS(curTS, pps)
 				}
-				// 確保拿到 IDR 再開始送
+				// 等新 IDR
 				waitKF = true
 				stateMu.Lock()
 				needKeyframe = true
@@ -246,11 +239,9 @@ func main() {
 					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
 					requestKeyframe()
 				}
-
 				if !idrInThisAU {
 					goto stats
 				}
-
 				log.Println("[KF] 偵測到 IDR，開始送流")
 				stateMu.Lock()
 				needKeyframe = false
@@ -445,42 +436,37 @@ func requestKeyframe() {
 }
 
 type touchEvent struct {
-	Type     string  `json:"type"` // "down" | "up" | "move" | "cancel"
-	ID       uint64  `json:"id"`   // pointer id
-	X        int32   `json:"x"`
-	Y        int32   `json:"y"`
-	Width    uint16  `json:"width"`  // 來源端可傳，但我們忽略
-	Height   uint16  `json:"height"` // 來源端可傳，但我們忽略
-	Pressure float64 `json:"pressure"`
-	Buttons  uint32  `json:"buttons"`
+	Type         string  `json:"type"` // "down" | "up" | "move" | "cancel"
+	ID           uint64  `json:"id"`   // pointer id
+	X            int32   `json:"x"`
+	Y            int32   `json:"y"`
+	Pressure     float64 `json:"pressure"`
+	Buttons      uint32  `json:"buttons"`
+	ActionButton uint32  `json:"actionButton"` // 新版 scrcpy 需要
 }
 
+// handleTouchEvent：依 scrcpy 新版控制訊息(含 action_button) 序列化為 32 bytes：
+// [type=1][action=1][pointer_id=8][x=4][y=4][w=2][h=2][pressure=2][action_button=4][buttons=4]
 func handleTouchEvent(ev touchEvent) {
 	if controlConn == nil {
 		return
 	}
 
 	var action uint8
-	var actionButton uint32
 
 	pointerMu.Lock()
 	prev := pointerButtons[ev.ID]
 	switch ev.Type {
 	case "down":
 		action = 0 // AMOTION_EVENT_ACTION_DOWN
-		actionButton = ev.Buttons &^ prev
 	case "up":
 		action = 1 // AMOTION_EVENT_ACTION_UP
-		actionButton = prev &^ ev.Buttons
 	case "move":
 		action = 2 // AMOTION_EVENT_ACTION_MOVE
-		actionButton = 0
 	case "cancel":
 		action = 3 // AMOTION_EVENT_ACTION_CANCEL
-		actionButton = 0
 	default:
 		action = 2
-		actionButton = 0
 	}
 	pointerButtons[ev.ID] = ev.Buttons
 	pointerMu.Unlock()
@@ -490,7 +476,7 @@ func handleTouchEvent(ev touchEvent) {
 	sw, sh := videoW, videoH
 	stateMu.RUnlock()
 
-	// 夾住座標，避免越界（保守處理）
+	// 夾住座標
 	if ev.X < 0 {
 		ev.X = 0
 	}
@@ -506,22 +492,9 @@ func handleTouchEvent(ev touchEvent) {
 		}
 	}
 
-	// ====== 序列化（總長 32 bytes）======
-	// 注意：不同 scrcpy 版本控制訊息格式可能不同，這裡以常見版本為準
-	buf := make([]byte, 32)
-	buf[0] = 2                                 // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
-	buf[1] = action                            // action
-	binary.BigEndian.PutUint64(buf[2:], ev.ID) // pointer_id (u64)
-
-	// position: x(int32), y(int32), w(u16), h(u16) — 大端序
-	binary.BigEndian.PutUint32(buf[10:], uint32(ev.X))
-	binary.BigEndian.PutUint32(buf[14:], uint32(ev.Y))
-	binary.BigEndian.PutUint16(buf[18:], sw)
-	binary.BigEndian.PutUint16(buf[20:], sh)
-
-	// pressure: 0..1 → u16 固定小數；UP 事件壓力歸 0
+	// pressure: 0..1 → u16 固定小數；UP/CANCEL 壓力歸 0
 	var p uint16
-	if action != 1 {
+	if action != 1 && action != 3 {
 		f := ev.Pressure
 		if f < 0 {
 			f = 0
@@ -534,10 +507,40 @@ func handleTouchEvent(ev touchEvent) {
 			p = uint16(math.Round(f * 65535))
 		}
 	}
+
+	// ====== 序列化（總長 32 bytes）======
+	buf := make([]byte, 32)
+	buf[0] = 2                                 // SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
+	buf[1] = action                            // action
+	binary.BigEndian.PutUint64(buf[2:], ev.ID) // pointer_id (u64)
+
+	// position: x(int32), y(int32), w(u16), h(u16) — 大端序
+	binary.BigEndian.PutUint32(buf[10:], uint32(ev.X))
+	binary.BigEndian.PutUint32(buf[14:], uint32(ev.Y))
+	binary.BigEndian.PutUint16(buf[18:], sw)
+	binary.BigEndian.PutUint16(buf[20:], sh)
+
+	// pressure
 	binary.BigEndian.PutUint16(buf[22:], p)
 
-	// action_button (u32) + buttons (u32)
-	binary.BigEndian.PutUint32(buf[24:], actionButton)
+	// action_button + buttons
+	// 若前端未給 actionButton，退化為推估：down 用新增位、up 用釋放位，否則 0
+	actionBtn := ev.ActionButton
+	if actionBtn == 0 {
+		switch action {
+		case 0: // down
+			actionBtn = ev.Buttons &^ prev
+			if actionBtn == 0 {
+				actionBtn = 1 // Primary 預設
+			}
+		case 1: // up
+			actionBtn = prev &^ ev.Buttons
+			if actionBtn == 0 {
+				actionBtn = 1
+			}
+		}
+	}
+	binary.BigEndian.PutUint32(buf[24:], actionBtn)
 	binary.BigEndian.PutUint32(buf[28:], ev.Buttons)
 
 	controlMu.Lock()
@@ -548,9 +551,7 @@ func handleTouchEvent(ev touchEvent) {
 }
 
 // === RTP 發送（以指定 TS） ===
-// FIX: Packetizer 的 Packetize 第二參數是「samples（累加量）」不是「timestamp」
-//
-//	我們改為 samples=0，並手動覆寫每個封包的 p.Timestamp=ts，確保同一幀所有封包 timestamp 一致
+// Packetizer 的第二參數是「samples 累加量」不是 timestamp，我們統一設 0 並覆寫 p.Timestamp=ts。
 func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
@@ -563,10 +564,10 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 		if len(n) == 0 {
 			continue
 		}
-		pkts := pk.Packetize(n, 0) // FIX: samples=0，不讓內部累加
+		pkts := pk.Packetize(n, 0)
 		for j, p := range pkts {
-			p.Timestamp = ts                                     // FIX: 覆寫 timestamp
-			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1) // AU 最末封包設 Marker
+			p.Timestamp = ts
+			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
@@ -586,10 +587,10 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 		if len(n) == 0 {
 			continue
 		}
-		pkts := pk.Packetize(n, 0) // FIX: samples=0
+		pkts := pk.Packetize(n, 0)
 		for _, p := range pkts {
-			p.Timestamp = ts // FIX: 覆寫 timestamp
-			p.Marker = false // 參數集不當作獨立 AU
+			p.Timestamp = ts
+			p.Marker = false // 參數集不當 AU
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("RTP write error:", err)
 			}
@@ -625,13 +626,11 @@ func splitAnnexBNALUs(b []byte) [][]byte {
 
 func findStartCode(b []byte, from int) (int, int) {
 	for i := from; i+3 <= len(b); i++ {
-		// 00 00 01
 		if i+3 <= len(b) && b[i] == 0 && b[i+1] == 0 && b[i+2] == 1 {
-			return i, i + 3
+			return i, i + 3 // 00 00 01
 		}
-		// 00 00 00 01
 		if i+4 <= len(b) && b[i] == 0 && b[i+1] == 0 && b[i+2] == 0 && b[i+3] == 1 {
-			return i, i + 4
+			return i, i + 4 // 00 00 00 01
 		}
 	}
 	return -1, -1
@@ -644,37 +643,23 @@ func naluType(n []byte) uint8 {
 	return n[0] & 0x1F
 }
 
-func h264NaluName(t uint8) string {
-	switch t {
-	case 5:
-		return "IDR"
-	case 6:
-		return "SEI"
-	case 7:
-		return "SPS"
-	case 8:
-		return "PPS"
-	case 9:
-		return "AUD"
-	default:
-		return fmt.Sprintf("type=%d", t)
-	}
-}
-
-// === PTS → RTP TS 轉換 ===
 func rtpTSFromPTS(pts, base uint64) uint32 {
 	delta := pts - base
-	return uint32((delta * 90000) / ptsPerSecond) // 90kHz * 秒數
+	return uint32((delta * 90000) / ptsPerSecond)
 }
 
-// === H.264 SPS 解析寬高（極簡實作，足夠抓常見 4:2:0） ===
+// === H.264 SPS 解析寬高（簡化足夠用） ===
+// ...（原實作保持不變）
+/* 省略：parseH264SPSDimensions、bitReader 實作，與你現有版本一致 */
+
+// 解析 SPS 寬高（簡化版）
 func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 	if len(nal) < 4 || (nal[0]&0x1F) != 7 {
 		return
 	}
-	// 去除 emulation prevention bytes（00 00 03 → 00 00）
+	// 去除 emulation prevention bytes
 	rbsp := make([]byte, 0, len(nal)-1)
-	for i := 1; i < len(nal); i++ { // 跳過 NAL header
+	for i := 1; i < len(nal); i++ {
 		if i+2 < len(nal) && nal[i] == 0 && nal[i+1] == 0 && nal[i+2] == 3 {
 			rbsp = append(rbsp, 0, 0)
 			i += 2
@@ -724,7 +709,7 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 		if f, ok2 := br.u(1); !ok2 {
 			return
 		} else if f == 1 {
-			// 略過 scaling_list
+			// 略過 scaling_list（粗略）
 			n := 8
 			if chromaFormatIDC == 3 {
 				n = 12
@@ -733,7 +718,6 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 				if g, ok3 := br.u(1); !ok3 {
 					return
 				} else if g == 1 {
-					// 略過 scaling_list 內容（簡化: 粗略跳過）
 					size := 16
 					if i >= 6 {
 						size = 64
@@ -872,7 +856,7 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 // --- 極簡 bit reader ---
 type bitReader struct {
 	b []byte
-	i int // bit index
+	i int
 }
 
 func (br *bitReader) u(n int) (uint, bool) {
