@@ -1,15 +1,24 @@
+// main.go — 線路格式對齊官方：觸控載荷 31B + type 1B = 總 32B；
+// 觸控 ≤10 指映射；mouse/pen 固定用 ID 0；忽略滑鼠 hover move；
+// DataChannel 收到控制訊號時印出原始資料並照官方順序編碼後直寫 control socket。
+// ★ 新增：control socket 讀回解析（DeviceMessage：clipboard）、心跳 GET_CLIPBOARD、寫入 deadline/耗時告警。
+
 package main
 
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net"
 	"net/http"
+	_ "net/http/pprof" // 啟用 /debug/pprof
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -22,8 +31,25 @@ import (
 )
 
 const (
-	controlMsgResetVideo = 17
-	ptsPerSecond         = uint64(1_000_000) // scrcpy PTS 單位：微秒
+	controlMsgResetVideo   = 17                // TYPE_RESET_VIDEO
+	controlMsgGetClipboard = 8                 // TYPE_GET_CLIPBOARD
+	ptsPerSecond           = uint64(1_000_000) // scrcpy PTS 單位：微秒
+)
+
+// ---- 可調偵錯閾值 ----
+const (
+	criticalWriteTimeout = 120 * time.Millisecond
+	warnCtrlWriteOver    = 30 * time.Millisecond // 控制通道單次寫入超過此值就告警
+	warnFrameMetaOver    = 20 * time.Millisecond // 讀 frame meta >20ms
+	warnFrameReadOver    = 50 * time.Millisecond // 讀 frame data >50ms
+	statsLogEvery        = 100                   // 每 100 幀打印統計
+	keyframeTick         = 5 * time.Second       // 週期性請求關鍵幀
+
+	// control 心跳與讀回監控
+	controlHealthTick      = 5 * time.Second  // 每 5s 檢查一次讀回
+	controlStaleAfter      = 15 * time.Second // 超過 15s 無讀回就送 GET_CLIPBOARD 心跳
+	controlReadBufMax      = 1 << 20          // 讀回緩衝上限（1MB，足夠容納剪貼簿）
+	deviceMsgTypeClipboard = 0                // 目前僅解析 clipboard
 )
 
 // === 全域狀態 ===
@@ -39,9 +65,11 @@ var (
 
 	stateMu sync.RWMutex
 
-	startTime   time.Time // 速率統計
-	controlConn io.ReadWriter
-	controlMu   sync.Mutex
+	startTime     time.Time // 速率統計
+	controlConn   io.ReadWriter
+	controlMu     sync.Mutex
+	lastCtrlRead  time.Time // 最近一次從 control socket 讀到裝置訊息
+	lastCtrlWrite time.Time // 最近一次成功寫入 control
 
 	// 觀測 PLI/FIR 與 AU 序號
 	lastPLI       time.Time
@@ -63,83 +91,156 @@ var (
 	pointerButtons = make(map[uint64]uint32)
 )
 
-// ====== 控制面（DataChannel → scrcpy socket）======
+// ====== 指標（expvar）======
+var (
+	evFramesRead         = expvar.NewInt("frames_read")
+	evBytesRead          = expvar.NewInt("bytes_read")
+	evPLICount           = expvar.NewInt("pli_count")
+	evKeyframeRequests   = expvar.NewInt("keyframe_requests")
+	evCtrlWritesOK       = expvar.NewInt("control_writes_ok")
+	evCtrlWritesErr      = expvar.NewInt("control_writes_err")
+	evCtrlReadsOK        = expvar.NewInt("control_reads_ok")
+	evCtrlReadsErr       = expvar.NewInt("control_reads_err")
+	evCtrlReadClipboardB = expvar.NewInt("control_read_clipboard_bytes")
+	evNALU_SPS           = expvar.NewInt("nalu_sps")
+	evNALU_PPS           = expvar.NewInt("nalu_pps")
+	evNALU_IDR           = expvar.NewInt("nalu_idr")
+	evNALU_Others        = expvar.NewInt("nalu_others")
+	evRTCP_PLI           = expvar.NewInt("rtcp_pli")
+	evRTCP_FIR           = expvar.NewInt("rtcp_fir")
+	evVideoW             = expvar.NewInt("video_w")
+	evVideoH             = expvar.NewInt("video_h")
+	evLastCtrlWriteMS    = expvar.NewInt("last_control_write_ms")
+	evLastFrameMetaMS    = expvar.NewInt("last_frame_meta_ms")
+	evLastFrameReadMS    = expvar.NewInt("last_frame_read_ms")
+	evAuSeq              = expvar.NewInt("au_seq")
+	evFramesSinceKF      = expvar.NewInt("frames_since_kf")
+	evPendingPointers    = expvar.NewInt("pending_pointers")
+	evActivePeer         = expvar.NewInt("active_peer") // 0/1
+	evLastCtrlReadMsAgo  = expvar.NewInt("last_control_read_ms_ago")
+	evHeartbeatSent      = expvar.NewInt("control_heartbeat_sent")
+)
 
-// 可靠關鍵事件隊列（down/up/cancel），決不丟；容量不要太大，避免長時間延後
-var criticalQ = make(chan []byte, 512)
-
-// 每指的最新 move（合併）；刷寫協程會以固定頻率送出
-type moveKey struct{ id uint64 }
-
-var moveMu sync.Mutex
-var latestMove = map[moveKey][]byte{}
-
-// move 刷新頻率（視網頁端 pointermove 頻率與網路情況可微調）
-const moveFlushHz = 90
-
-// 若 socket 堵塞，對「關鍵事件」的最長等待（避免永無止境卡死）
-const criticalWriteTimeout = 120 * time.Millisecond
-
-// move 寫入的最長等待（更短；無法寫就丟）
-const moveWriteTimeout = 20 * time.Millisecond
-
-func startControlWriters() {
-	// 可靠事件寫入器
+// ====== 工具：安全啟動 goroutine，避免 panic 默默死掉 ======
+func goSafe(name string, fn func()) {
 	go func() {
-		for pkt := range criticalQ {
-			writeWithDeadline(pkt, criticalWriteTimeout, true)
-		}
-	}()
-
-	// move 合併刷寫器
-	go func() {
-		ticker := time.NewTicker(time.Second / moveFlushHz)
-		defer ticker.Stop()
-		for range ticker.C {
-			moveMu.Lock()
-			batches := make([][]byte, 0, len(latestMove))
-			for _, b := range latestMove {
-				batches = append(batches, b)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[PANIC][%s] %v\n%s", name, r, debug.Stack())
 			}
-			latestMove = make(map[moveKey][]byte)
-			moveMu.Unlock()
-
-			for _, pkt := range batches {
-				writeWithDeadline(pkt, moveWriteTimeout, false)
-			}
-		}
+		}()
+		fn()
 	}()
 }
 
-// 寫入控制 socket（可設 deadline；對關鍵事件可稍長一點）
-func writeWithDeadline(b []byte, d time.Duration, isCritical bool) {
-	if controlConn == nil {
+// ====== ★ 觸控 pointer 映射（限制活躍 ≤ 10；ID 0 給 mouse/pen）======
+const maxPointers = 10
+
+var touchMu sync.Mutex
+
+// remoteID -> local slot (0..9)
+var touchLocalByRemote = map[uint64]uint16{}
+
+// local slot -> remoteID；slot 是否使用
+var touchRemoteByLocal [maxPointers]uint64
+var touchSlotUsed [maxPointers]bool
+
+func getLocalSlot(remote uint64) (uint16, bool) {
+	if s, ok := touchLocalByRemote[remote]; ok {
+		return s, true
+	}
+	return 0, false
+}
+func allocLocalSlot(remote uint64) (uint16, bool) {
+	if s, ok := touchLocalByRemote[remote]; ok {
+		return s, true
+	}
+	for i := 0; i < maxPointers; i++ {
+		if !touchSlotUsed[i] {
+			touchSlotUsed[i] = true
+			touchLocalByRemote[remote] = uint16(i)
+			touchRemoteByLocal[i] = remote
+			return uint16(i), true
+		}
+	}
+	return 0, false
+}
+func freeLocalSlot(remote uint64) {
+	if s, ok := touchLocalByRemote[remote]; ok {
+		delete(touchLocalByRemote, remote)
+		idx := int(s)
+		touchSlotUsed[idx] = false
+		touchRemoteByLocal[idx] = 0
+	}
+}
+
+// 寫入控制 socket：**一定寫完整個封包**，並可選設置 write deadline（避免長時間阻塞）
+func writeFull(b []byte, deadline time.Duration, setDeadline bool) {
+	if controlConn == nil || len(b) == 0 {
 		return
 	}
+	start := time.Now()
 	controlMu.Lock()
 	defer controlMu.Unlock()
 
-	// 嘗試對 net.Conn 設定 deadline；不是 net.Conn 就照常寫
-	if c, ok := controlConn.(net.Conn); ok {
-		_ = c.SetWriteDeadline(time.Now().Add(d))
-		defer c.SetWriteDeadline(time.Time{})
-	}
-	_, err := controlConn.Write(b)
-	if err != nil {
-		if isCritical {
-			log.Println("[CTRL] write critical err:", err)
+	// 嘗試設置 write deadline（若底層支援）
+	if setDeadline {
+		if c, ok := controlConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = c.SetWriteDeadline(time.Now().Add(deadline))
 		}
-		// move 錯誤可忽略
+	}
+
+	total := 0
+	for total < len(b) {
+		n, err := controlConn.Write(b[total:])
+		total += n
+		if err != nil {
+			evCtrlWritesErr.Add(1)
+			log.Printf("[CTRL] write error after %d/%d bytes (elapsed=%v, deadline=%v): %v",
+				total, len(b), time.Since(start), setDeadline, err)
+			return
+		}
+	}
+	elapsed := time.Since(start)
+	lastCtrlWrite = time.Now()
+	evLastCtrlWriteMS.Set(elapsed.Milliseconds())
+	evCtrlWritesOK.Add(1)
+	if elapsed > warnCtrlWriteOver {
+		log.Printf("[CTRL] write 慢 (%v) deadline=%v size=%d", elapsed, setDeadline, len(b))
+	}
+	// 若曾設置 deadline，寫完後清掉（避免影響其他操作）
+	if setDeadline {
+		if c, ok := controlConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = c.SetWriteDeadline(time.Time{})
+		}
 	}
 }
 
-// 把 JSON 事件轉成 scrcpy（你使用的）32 bytes 格式並入列
+// ====== 前端事件（JSON）→ 官方線路格式（32 bytes）======
+type touchEvent struct {
+	Type        string  `json:"type"` // "down" | "up" | "move" | "cancel"
+	ID          uint64  `json:"id"`   // pointer id（前端的）
+	X           int32   `json:"x"`
+	Y           int32   `json:"y"`
+	ScreenW     uint16  `json:"screenW"`     // 原生寬
+	ScreenH     uint16  `json:"screenH"`     // 原生高
+	Pressure    float64 `json:"pressure"`    // 0..1
+	Buttons     uint32  `json:"buttons"`     // mouse buttons bitmask；touch 一律 0
+	PointerType string  `json:"pointerType"` // "mouse" | "touch" | "pen"
+}
+
 func handleTouchEvent(ev touchEvent) {
+	defer func() {
+		pointerMu.Lock()
+		evPendingPointers.Set(int64(len(pointerButtons)))
+		pointerMu.Unlock()
+	}()
+
 	if controlConn == nil {
 		return
 	}
 
-	// 讀前端傳過來的畫面寬高，若無則退回伺服器解析到的寬高
+	// 取映射用的畫面寬高（前端沒帶就用後備）
 	stateMu.RLock()
 	fallbackW, fallbackH := videoW, videoH
 	stateMu.RUnlock()
@@ -149,7 +250,7 @@ func handleTouchEvent(ev touchEvent) {
 		sw, sh = fallbackW, fallbackH
 	}
 
-	// 夾住座標（保守處理，避免越界）
+	// 夾住座標
 	if ev.X < 0 {
 		ev.X = 0
 	}
@@ -165,7 +266,7 @@ func handleTouchEvent(ev touchEvent) {
 		}
 	}
 
-	// 計算 action 與 action_button（只有 pointerType=mouse 才有意義）
+	// 轉 action
 	var action uint8
 	switch ev.Type {
 	case "down":
@@ -180,17 +281,53 @@ func handleTouchEvent(ev touchEvent) {
 		action = 2
 	}
 
-	var actionButton uint32
-	pointerMu.Lock()
-	prevButtons := pointerButtons[ev.ID]
-	nowButtons := ev.Buttons
-
-	// 對觸控（pointerType="touch"）按 Android 規範不送任何 mouse buttons
-	// 前端已經將 touch 的 buttons 規一為 0，這裡保險起見再做一次
-	if ev.PointerType == "touch" {
-		nowButtons = 0
+	// ★ 計算送出的 pointerID
+	var pointerID uint64
+	if ev.PointerType != "touch" {
+		// mouse/pen → 永遠使用 0，且忽略 hover move（無按鍵）
+		pointerID = 0
+		if action == 2 /*move*/ && ev.Buttons == 0 {
+			return
+		}
+	} else {
+		// touch → 對 remote ID 映射到 1..10（slot 0..9 對應 1..10；0 保留給滑鼠/pen）
+		touchMu.Lock()
+		switch action {
+		case 0: // down
+			if s, ok := allocLocalSlot(ev.ID); ok {
+				pointerID = uint64(s + 1) // 1..10
+			} else {
+				touchMu.Unlock()
+				log.Printf("[CTRL][TOUCH] 丟棄 down（超過 %d 指） id=%d", maxPointers, ev.ID)
+				return
+			}
+		case 1, 3: // up/cancel
+			if s, ok := getLocalSlot(ev.ID); ok {
+				pointerID = uint64(s + 1)
+				freeLocalSlot(ev.ID)
+			} else {
+				touchMu.Unlock()
+				return
+			}
+		default: // move
+			if s, ok := getLocalSlot(ev.ID); ok {
+				pointerID = uint64(s + 1)
+			} else {
+				touchMu.Unlock()
+				return
+			}
+		}
+		touchMu.Unlock()
 	}
 
+	// 計算 action_button / buttons 狀態
+	var actionButton uint32
+	pointerMu.Lock()
+	prevButtons := pointerButtons[pointerID]
+	nowButtons := ev.Buttons
+	if ev.PointerType == "touch" {
+		nowButtons = 0 // 觸控不帶 mouse buttons
+	}
 	switch action {
 	case 0: // down
 		actionButton = nowButtons &^ prevButtons
@@ -199,10 +336,14 @@ func handleTouchEvent(ev touchEvent) {
 	default:
 		actionButton = 0
 	}
-	pointerButtons[ev.ID] = nowButtons
+	if action == 1 /*up*/ || action == 3 /*cancel*/ {
+		delete(pointerButtons, pointerID)
+	} else {
+		pointerButtons[pointerID] = nowButtons
+	}
 	pointerMu.Unlock()
 
-	// 壓力轉 u16 固定小數（UP 事件強制 0）
+	// 壓力（UP 事件強制 0） → u16 fixed-point（官方）
 	var p uint16
 	if action != 1 {
 		f := ev.Pressure
@@ -218,21 +359,21 @@ func handleTouchEvent(ev touchEvent) {
 		}
 	}
 
-	// ====== 32 bytes 格式（你的 scrcpy 變體）======
-	// 0:  type=2 (INJECT_TOUCH_EVENT)
-	// 1:  action (u8)
-	// 2..9:  pointer_id (u64)
-	// 10..13: x (i32)
-	// 14..17: y (i32)
-	// 18..19: screenW (u16)
-	// 20..21: screenH (u16)
-	// 22..23: pressure (u16, 0..65535，0xffff 代表 1.0)
-	// 24..27: action_button (u32)  ← 你的 32bytes 版本特有
-	// 28..31: buttons (u32)
+	// ====== 官方線路格式（總 32 bytes）======
+	// [0]    : type = 2 (INJECT_TOUCH_EVENT)
+	// [1]    : action (u8)
+	// [2:10] : pointerId (i64)
+	// [10:14]: x (i32)
+	// [14:18]: y (i32)
+	// [18:20]: screenW (u16)
+	// [20:22]: screenH (u16)
+	// [22:24]: pressure (u16 fixed-point)
+	// [24:28]: actionButton (i32)
+	// [28:32]: buttons (i32)
 	buf := make([]byte, 32)
 	buf[0] = 2
 	buf[1] = action
-	binary.BigEndian.PutUint64(buf[2:], ev.ID)
+	binary.BigEndian.PutUint64(buf[2:], pointerID)
 	binary.BigEndian.PutUint32(buf[10:], uint32(ev.X))
 	binary.BigEndian.PutUint32(buf[14:], uint32(ev.Y))
 	binary.BigEndian.PutUint16(buf[18:], sw)
@@ -241,91 +382,100 @@ func handleTouchEvent(ev touchEvent) {
 	binary.BigEndian.PutUint32(buf[24:], actionButton)
 	binary.BigEndian.PutUint32(buf[28:], nowButtons)
 
-	// 入列：關鍵事件走 criticalQ、move 走合併池
-	if action == 2 { // move
-		moveMu.Lock()
-		latestMove[moveKey{ev.ID}] = buf
-		moveMu.Unlock()
-	} else {
-		select {
-		case criticalQ <- buf:
-			// ok
-		default:
-			// 若 criticalQ 滿了，仍然盡力寫（避免按鍵卡死）
-			writeWithDeadline(buf, criticalWriteTimeout, true)
-		}
-	}
+	// 像官方：事件到就直接寫 socket（不合併、不延遲）
+	writeFull(buf, criticalWriteTimeout, true)
 }
 
 // ========= 伺服器入口 =========
 
 func main() {
-	// 靜態檔案 + SDP handler
-	fs := http.FileServer(http.Dir("./web"))
-	http.Handle("/", fs)
+	// 進階 log 格式（含毫秒與檔名:行號）
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	log.SetOutput(io.Discard)
+	// 基礎 HTTP/除錯
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.ServeFile(w, r, "index.html")
+			return
+		}
+		http.FileServer(http.Dir(".")).ServeHTTP(w, r)
+	})
 	http.HandleFunc("/offer", handleOffer)
+	http.HandleFunc("/debug/stack", func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write(buf[:n])
+	})
 
-	// 啟動 HTTP
-	go func() {
-		log.Println("HTTP 伺服器: http://localhost:8080/  (SDP: POST /offer)")
-		srv := &http.Server{Addr: ":8080"}
+	goSafe("http-server", func() {
+		addr := ":8080"
+		log.Println("[HTTP] 服務啟動:", addr, "（/ , /offer , /debug/pprof , /debug/vars , /debug/stack）")
+		srv := &http.Server{Addr: addr}
 		log.Fatal(srv.ListenAndServe())
-	}()
+	})
 
 	// 連線到第一台 Android 裝置
 	dev, err := adb.NewDevice("")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("[ADB] NewDevice:", err)
 	}
 	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", adb.ScrcpyPort)); err != nil {
-		log.Fatal("reverse:", err)
+		log.Fatal("[ADB] reverse:", err)
 	}
 	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
-		log.Fatal("push server:", err)
+		log.Fatal("[ADB] push server:", err)
 	}
 	conn, err := dev.StartServer()
 	if err != nil {
-		log.Fatal("start server:", err)
+		log.Fatal("[ADB] start server:", err)
 	}
 	defer conn.VideoStream.Close()
 	defer conn.Control.Close()
 	controlConn = conn.Control
+	log.Println("[ADB] 已連上 scrcpy server")
 
-	// 控制通道清空（避免裝置回傳的 clipboard 等把管道塞爆）
-	go func(r io.Reader) {
-		_, _ = io.Copy(io.Discard, r)
-	}(conn.Control)
+	// 控制通道讀回解析：避免阻塞、可觀測是否有裝置回傳（像 clipboard）
+	goSafe("control-reader", func() {
+		readDeviceMessages(controlConn)
+	})
 
-	// 啟動控制寫入協程
-	startControlWriters()
+	// 週期性 control 健康檢查（必要時送 GET_CLIPBOARD 當心跳）
+	goSafe("control-health", func() {
+		t := time.NewTicker(controlHealthTick)
+		defer t.Stop()
+		for range t.C {
+			if controlConn == nil {
+				continue
+			}
+			ms := time.Since(lastCtrlRead).Milliseconds()
+			if ms < 0 {
+				ms = 0
+			}
+			evLastCtrlReadMsAgo.Set(ms)
 
-	// 週期性請求關鍵幀（可依需求調整）
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			stateMu.Lock()
-			needKeyframe = true
-			stateMu.Unlock()
-			log.Println("[KF] 週期性請求關鍵幀")
-			requestKeyframe()
+			if time.Since(lastCtrlRead) > controlStaleAfter {
+				// 送一個 GET_CLIPBOARD 促使 server 回傳，確認雙向通暢
+				sendGetClipboard(0) // copyKey=COPY_KEY_NONE
+				evHeartbeatSent.Add(1)
+			}
 		}
-	}()
+	})
 
-	log.Println("開始接收視訊串流")
+	log.Println("[VIDEO] 開始接收視訊串流")
 
-	// 跳過裝置名稱 (64 bytes, 以 NUL 結尾)
+	// 跳過裝置名稱 (64 bytes, NUL 結尾)
 	nameBuf := make([]byte, 64)
 	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
-		log.Fatal("read device name:", err)
+		log.Fatal("[VIDEO] read device name:", err)
 	}
 	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
-	log.Printf("裝置名稱: %s\n", deviceName)
+	log.Printf("[VIDEO] 裝置名稱: %s", deviceName)
 
 	// 視訊標頭 (12 bytes)：[codecID(u32)][w(u32)][h(u32)]
 	vHeader := make([]byte, 12)
 	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
-		log.Fatal("read video header:", err)
+		log.Fatal("[VIDEO] read video header:", err)
 	}
 	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（依版本可能不同）
 	w0 := binary.BigEndian.Uint32(vHeader[4:8])
@@ -334,11 +484,12 @@ func main() {
 	stateMu.Lock()
 	videoW, videoH = uint16(w0), uint16(h0) // 後備觸控映射空間
 	stateMu.Unlock()
+	evVideoW.Set(int64(videoW))
+	evVideoH.Set(int64(videoH))
 
-	log.Printf("編碼ID: %d, 解析度: %dx%d\n", codecID, w0, h0)
+	log.Printf("[VIDEO] 編碼ID: %d, 初始解析度: %dx%d", codecID, w0, h0)
 
-	// 接收幀迴圈
-	// 多數版本下 frame meta 是 12 bytes：[PTS(u64)] + [size(u32)]
+	// 接收幀迴圈（多數版本：meta 12 bytes：[PTS(u64)] + [size(u32)]）
 	meta := make([]byte, 12)
 	startTime = time.Now()
 	var frameCount int
@@ -346,10 +497,17 @@ func main() {
 
 	for {
 		// frame meta
+		t0 := time.Now()
 		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
-			log.Println("read frame meta:", err)
+			log.Println("[VIDEO] read frame meta:", err)
 			break
 		}
+		metaElapsed := time.Since(t0)
+		evLastFrameMetaMS.Set(metaElapsed.Milliseconds())
+		if metaElapsed > warnFrameMetaOver {
+			log.Printf("[VIDEO] 讀 meta 偏慢: %v", metaElapsed)
+		}
+
 		pts := binary.BigEndian.Uint64(meta[0:8])
 		frameSize := binary.BigEndian.Uint32(meta[8:12])
 
@@ -362,10 +520,16 @@ func main() {
 		curTS := rtpTS0 + rtpTSFromPTS(pts, pts0)
 
 		// frame data
+		t1 := time.Now()
 		frame := make([]byte, frameSize)
 		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
-			log.Println("read frame:", err)
+			log.Println("[VIDEO] read frame:", err)
 			break
+		}
+		readElapsed := time.Since(t1)
+		evLastFrameReadMS.Set(readElapsed.Milliseconds())
+		if readElapsed > warnFrameReadOver {
+			log.Printf("[VIDEO] 讀 frame 偏慢: %v (size=%d)", readElapsed, frameSize)
 		}
 
 		// 解析 Annex-B → NALUs，並快取 SPS/PPS、偵測是否含 IDR
@@ -373,22 +537,26 @@ func main() {
 
 		idrInThisAU := false
 		var gotNewSPS bool
+		var spsCnt, ppsCnt, idrCnt, othersCnt int
 
 		for _, n := range nalus {
 			switch naluType(n) {
 			case 7: // SPS
+				spsCnt++
 				stateMu.Lock()
 				if !bytes.Equal(lastSPS, n) {
-					// 嘗試從新 SPS 解析寬高（常見 4:2:0）
 					if w, h, ok := parseH264SPSDimensions(n); ok {
 						videoW, videoH = w, h
 						gotNewSPS = true
+						evVideoW.Set(int64(videoW))
+						evVideoH.Set(int64(videoH))
 						log.Printf("[AU] 更新 SPS 並套用解析度 %dx%d 給觸控映射(後備)", w, h)
 					}
 				}
 				lastSPS = append([]byte(nil), n...)
 				stateMu.Unlock()
 			case 8: // PPS
+				ppsCnt++
 				stateMu.Lock()
 				if !bytes.Equal(lastPPS, n) {
 					log.Printf("[AU] 更新 PPS (len=%d)", len(n))
@@ -396,11 +564,18 @@ func main() {
 				lastPPS = append([]byte(nil), n...)
 				stateMu.Unlock()
 			case 5: // IDR
+				idrCnt++
 				idrInThisAU = true
+			default:
+				othersCnt++
 			}
 		}
+		evNALU_SPS.Add(int64(spsCnt))
+		evNALU_PPS.Add(int64(ppsCnt))
+		evNALU_IDR.Add(int64(idrCnt))
+		evNALU_Others.Add(int64(othersCnt))
 
-		// 讀取目前狀態
+		// 狀態
 		stateMu.RLock()
 		vt := videoTrack
 		pk := packetizer
@@ -409,7 +584,7 @@ func main() {
 
 		// 推進 WebRTC
 		if vt != nil && pk != nil {
-			// 如果剛換解析度，先把 SPS/PPS prepend，等待 IDR
+			// 若剛換解析度，先送 SPS/PPS，並請 IDR
 			if gotNewSPS {
 				stateMu.RLock()
 				sps := lastSPS
@@ -421,12 +596,12 @@ func main() {
 				if len(pps) > 0 {
 					sendNALUsAtTS(curTS, pps)
 				}
-				// 等待 IDR
 				waitKF = true
 				stateMu.Lock()
 				needKeyframe = true
 				stateMu.Unlock()
 				requestKeyframe()
+				evKeyframeRequests.Add(1)
 			}
 
 			if waitKF {
@@ -439,12 +614,15 @@ func main() {
 					sendNALUsAtTS(curTS, sps, pps)
 				} else {
 					requestKeyframe()
+					evKeyframeRequests.Add(1)
 				}
 
 				framesSinceKF++
+				evFramesSinceKF.Set(int64(framesSinceKF))
 				if framesSinceKF%30 == 0 {
 					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
 					requestKeyframe()
+					evKeyframeRequests.Add(1)
 				}
 
 				if !idrInThisAU {
@@ -456,6 +634,7 @@ func main() {
 				needKeyframe = false
 				framesSinceKF = 0
 				stateMu.Unlock()
+				evFramesSinceKF.Set(0)
 
 				sendNALUAccessUnitAtTS(nalus, curTS)
 			} else {
@@ -466,21 +645,25 @@ func main() {
 	stats:
 		frameCount++
 		totalBytes += int64(frameSize)
-		if frameCount%100 == 0 {
+		evFramesRead.Add(1)
+		evBytesRead.Add(int64(frameSize))
+
+		if frameCount%statsLogEvery == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			bytesPerSecond := float64(totalBytes) / elapsed
 			stateMu.RLock()
 			lp := lastPLI
 			pc := pliCount
 			stateMu.RUnlock()
-			log.Printf("接收影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s)",
-				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339))
+			log.Printf("[STATS] 影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s), AUseq=%d",
+				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339), auSeq)
 		}
 
 		// 下一 AU 序號
 		stateMu.Lock()
 		auSeq++
 		stateMu.Unlock()
+		evAuSeq.Set(int64(auSeq))
 	}
 }
 
@@ -492,7 +675,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 媒體編解碼設定：H.264，packetization-mode=1
+	// 媒體編解碼：H.264 packetization-mode=1
 	m := webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -514,6 +697,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peerConn = pc
+	evActivePeer.Set(1)
 
 	// 建立 H.264 RTP Track
 	track, err := webrtc.NewTrackLocalStaticRTP(
@@ -530,8 +714,8 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 讀 RTCP：解析 PLI / FIR，並請求關鍵幀
-	go func() {
+	// 讀 RTCP：PLI / FIR
+	goSafe("rtcp-reader", func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
 			n, _, err := sender.Read(rtcpBuf)
@@ -540,19 +724,20 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			}
 			pkts, err := rtcp.Unmarshal(rtcpBuf[:n])
 			if err != nil {
-				log.Println("RTCP unmarshal error:", err)
 				continue
 			}
 			for _, pkt := range pkts {
 				switch p := pkt.(type) {
 				case *rtcp.PictureLossIndication:
-					log.Println("[RTCP] 收到 PLI → needKeyframe = true")
 					stateMu.Lock()
 					needKeyframe = true
 					lastPLI = time.Now()
 					pliCount++
 					stateMu.Unlock()
+					evRTCP_PLI.Add(1)
+					evPLICount.Set(int64(pliCount))
 					requestKeyframe()
+					evKeyframeRequests.Add(1)
 				case *rtcp.FullIntraRequest:
 					log.Printf("[RTCP] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", p.SenderSSRC, p.MediaSSRC)
 					stateMu.Lock()
@@ -560,27 +745,58 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 					lastPLI = time.Now()
 					pliCount++
 					stateMu.Unlock()
+					evRTCP_FIR.Add(1)
+					evPLICount.Set(int64(pliCount))
 					requestKeyframe()
+					evKeyframeRequests.Add(1)
 				}
 			}
 		}
-	}()
+	})
 
-	// 接前端兩條 DataChannel
+	// 接前端 DataChannel（印原始資料 → 解析 → 注入）
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		log.Println("DataChannel:", dc.Label())
+		log.Println("[RTC] DataChannel:", dc.Label())
+
+		dc.OnOpen(func() { log.Println("[RTC] DC open:", dc.Label()) })
+		dc.OnClose(func() { log.Println("[RTC] DC close:", dc.Label()) })
+
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			log.Printf("[RTC][DC:%s] recv isString=%v len=%d", dc.Label(), msg.IsString, len(msg.Data))
+			if msg.IsString {
+				s := string(msg.Data)
+				if len(s) > 512 {
+					log.Printf("[RTC][DC:%s] data: %s ...(剩餘 %d 字元)", dc.Label(), s[:512], len(s)-512)
+				} else {
+					log.Printf("[RTC][DC:%s] data: %s", dc.Label(), s)
+				}
+			} else {
+				n := 128
+				if len(msg.Data) < n {
+					n = len(msg.Data)
+				}
+				hex := fmt.Sprintf("% x", msg.Data[:n])
+				if n < len(msg.Data) {
+					log.Printf("[RTC][DC:%s] data(hex %dB): %s ...(剩餘 %d bytes)", dc.Label(), n, hex, len(msg.Data)-n)
+				} else {
+					log.Printf("[RTC][DC:%s] data(hex): %s", dc.Label(), hex)
+				}
+			}
+
 			var ev touchEvent
 			if err := json.Unmarshal(msg.Data, &ev); err != nil {
-				log.Println("datachannel unmarshal:", err)
+				log.Printf("[RTC][DC:%s] json.Unmarshal 失敗：%v", dc.Label(), err)
 				return
 			}
+			log.Printf("[CTRL] touch: type=%s id=%d x=%d y=%d pressure=%.3f buttons=%d pointerType=%s screen=%dx%d",
+				ev.Type, ev.ID, ev.X, ev.Y, ev.Pressure, ev.Buttons, ev.PointerType, ev.ScreenW, ev.ScreenH)
+
 			handleTouchEvent(ev)
 		})
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Println("PeerConnection state:", s.String())
+		log.Println("[RTC] PeerConnection state:", s.String())
 		if s == webrtc.PeerConnectionStateFailed ||
 			s == webrtc.PeerConnectionStateClosed ||
 			s == webrtc.PeerConnectionStateDisconnected {
@@ -588,10 +804,11 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			videoTrack = nil
 			packetizer = nil
 			stateMu.Unlock()
+			evActivePeer.Set(0)
 		}
 	})
 
-	// 設定 Remote SDP / 建立 Answer / 等待 ICE（非 trickle）
+	// 設定 Remote SDP / Answer / 等待 ICE（非 trickle）
 	if err := pc.SetRemoteDescription(offer); err != nil {
 		http.Error(w, "set remote error", http.StatusInternalServerError)
 		return
@@ -625,8 +842,9 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	rtpTS0 = 0
 	stateMu.Unlock()
 
-	// 請求 Android 立刻送出關鍵幀
+	// 立刻請求關鍵幀
 	requestKeyframe()
+	evKeyframeRequests.Add(1)
 
 	// 回傳 Answer（含 ICE）
 	w.Header().Set("Content-Type", "application/json")
@@ -640,27 +858,109 @@ func requestKeyframe() {
 	}
 	controlMu.Lock()
 	defer controlMu.Unlock()
+	// 控制訊息：TYPE_RESET_VIDEO 僅 1 byte
 	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
-		log.Println("send RESET_VIDEO:", err)
+		log.Println("[CTRL] send RESET_VIDEO:", err)
+	} else {
+		log.Println("[CTRL] 已送出 RESET_VIDEO")
 	}
 }
 
-// ===== 型別/工具 =====
-
-type touchEvent struct {
-	Type        string  `json:"type"` // "down" | "up" | "move" | "cancel"
-	ID          uint64  `json:"id"`   // pointer id
-	X           int32   `json:"x"`
-	Y           int32   `json:"y"`
-	ScreenW     uint16  `json:"screenW"`     // 前端傳入的原生寬
-	ScreenH     uint16  `json:"screenH"`     // 前端傳入的原生高
-	Pressure    float64 `json:"pressure"`    // 0..1
-	Buttons     uint32  `json:"buttons"`     // 對 touch 會是 0
-	PointerType string  `json:"pointerType"` // "mouse" | "touch" | "pen"
+// 主動向 server 要求回傳剪貼簿（作為健康心跳）
+func sendGetClipboard(copyKey byte) {
+	if controlConn == nil {
+		return
+	}
+	controlMu.Lock()
+	defer controlMu.Unlock()
+	// [type=8][copyKey=1B]
+	if _, err := controlConn.Write([]byte{controlMsgGetClipboard, copyKey}); err != nil {
+		log.Println("[CTRL] send GET_CLIPBOARD:", err)
+	} else {
+		log.Println("[CTRL] 已送出 GET_CLIPBOARD (heartbeat)")
+	}
 }
 
-// === RTP 發送（以指定 TS） ===
-// FIX: Packetizer 的 Packetize 第二參數是 samples（累加量），我們改為 samples=0，並手動覆寫 p.Timestamp
+// === 控制通道讀回（DeviceMessage）===
+// 目前解析 TYPE_CLIPBOARD： [type(1)][len(4 BE)][utf8 bytes]
+func readDeviceMessages(r io.Reader) {
+	buf := make([]byte, 0, 4096)
+	readU8 := func() (byte, error) {
+		var b [1]byte
+		_, err := io.ReadFull(r, b[:])
+		return b[0], err
+	}
+	readU32BE := func() (uint32, error) {
+		var b [4]byte
+		_, err := io.ReadFull(r, b[:])
+		return binary.BigEndian.Uint32(b[:]), err
+	}
+
+	for {
+		typ, err := readU8()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			if err == io.EOF {
+				log.Println("[CTRL][READ] EOF")
+			} else {
+				log.Println("[CTRL][READ] error:", err)
+			}
+			evCtrlReadsErr.Add(1)
+			return
+		}
+
+		switch typ {
+		case deviceMsgTypeClipboard:
+			// len + data
+			n, err := readU32BE()
+			if err != nil {
+				log.Println("[CTRL][READ] clipboard len err:", err)
+				evCtrlReadsErr.Add(1)
+				return
+			}
+			if n > controlReadBufMax {
+				log.Printf("[CTRL][READ] clipboard 太大: %d > %d，截斷丟棄", n, controlReadBufMax)
+				// 丟棄 n bytes
+				if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
+					log.Println("[CTRL][READ] discard err:", err)
+					evCtrlReadsErr.Add(1)
+					return
+				}
+				continue
+			}
+			if cap(buf) < int(n) {
+				buf = make([]byte, n)
+			} else {
+				buf = buf[:n]
+			}
+			if _, err := io.ReadFull(r, buf[:n]); err != nil {
+				log.Println("[CTRL][READ] clipboard data err:", err)
+				evCtrlReadsErr.Add(1)
+				return
+			}
+			lastCtrlRead = time.Now()
+			evCtrlReadsOK.Add(1)
+			evCtrlReadClipboardB.Add(int64(n))
+			log.Printf("[CTRL][READ] DeviceMessage.CLIPBOARD %dB: %q", n, trimString(string(buf[:n]), 200))
+		default:
+			// 未知型別：無長度資訊 → 無法安全跳過，只記錄
+			lastCtrlRead = time.Now()
+			evCtrlReadsOK.Add(1)
+			log.Printf("[CTRL][READ] 未知 DeviceMessage type=%d（未解析，可能為未來版本）", typ)
+		}
+	}
+}
+
+func trimString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...(truncated)"
+}
+
+// === RTP 發送（以指定 TS）===
 func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
@@ -673,17 +973,16 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 		if len(n) == 0 {
 			continue
 		}
-		pkts := pk.Packetize(n, 0)
+		pkts := pk.Packetize(n, 0) // samples=0，手動覆寫 Timestamp
 		for j, p := range pkts {
 			p.Timestamp = ts
 			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
 			if err := vt.WriteRTP(p); err != nil {
-				log.Println("RTP write error:", err)
+				log.Println("[RTP] write error:", err)
 			}
 		}
 	}
 }
-
 func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 	stateMu.RLock()
 	pk := packetizer
@@ -701,7 +1000,7 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 			p.Timestamp = ts
 			p.Marker = false
 			if err := vt.WriteRTP(p); err != nil {
-				log.Println("RTP write error:", err)
+				log.Println("[RTP] write error:", err)
 			}
 		}
 	}
@@ -732,7 +1031,6 @@ func splitAnnexBNALUs(b []byte) [][]byte {
 	}
 	return nalus
 }
-
 func findStartCode(b []byte, from int) (int, int) {
 	for i := from; i+3 <= len(b); i++ {
 		// 00 00 01
@@ -746,7 +1044,6 @@ func findStartCode(b []byte, from int) (int, int) {
 	}
 	return -1, -1
 }
-
 func naluType(n []byte) uint8 {
 	if len(n) == 0 {
 		return 0
@@ -760,7 +1057,12 @@ func rtpTSFromPTS(pts, base uint64) uint32 {
 	return uint32((delta * 90000) / ptsPerSecond) // 90kHz * 秒數
 }
 
-// === H.264 SPS 解析寬高（極簡實作，足夠抓常見 4:2:0） ===
+// === H.264 SPS 解析寬高（極簡）===
+type bitReader struct {
+	b []byte
+	i int // bit index
+}
+
 func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 	if len(nal) < 4 || (nal[0]&0x1F) != 7 {
 		return
@@ -817,7 +1119,7 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 		if f, ok2 := br.u(1); !ok2 {
 			return
 		} else if f == 1 {
-			// 略過 scaling_list
+			// 粗略跳過 scaling_list
 			n := 8
 			if chromaFormatIDC == 3 {
 				n = 12
@@ -826,7 +1128,6 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 				if g, ok3 := br.u(1); !ok3 {
 					return
 				} else if g == 1 {
-					// 粗略跳過
 					size := 16
 					if i >= 6 {
 						size = 64
@@ -938,16 +1239,16 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 	mbWidth := (pwMinus1 + 1)
 	mbHeight := (phMinus1 + 1) * (2 - frameMbsOnlyFlag)
 
-	// 計算 crop 單位
+	// crop 單位
 	var subW, subH uint = 1, 1
 	switch chromaFormatIDC {
-	case 0: // monochrome
+	case 0:
 		subW, subH = 1, 1
-	case 1: // 4:2:0
+	case 1:
 		subW, subH = 2, 2
-	case 2: // 4:2:2
+	case 2:
 		subW, subH = 2, 1
-	case 3: // 4:4:4
+	case 3:
 		subW, subH = 1, 1
 	}
 	cropUnitX := subW
@@ -962,12 +1263,7 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 	return uint16(width), uint16(height), true
 }
 
-// --- 極簡 bit reader ---
-type bitReader struct {
-	b []byte
-	i int // bit index
-}
-
+// --- bitReader ---
 func (br *bitReader) u(n int) (uint, bool) {
 	if n <= 0 {
 		return 0, true
@@ -985,10 +1281,7 @@ func (br *bitReader) u(n int) (uint, bool) {
 	}
 	return v, true
 }
-func (br *bitReader) skip(n int) bool {
-	_, ok := br.u(n)
-	return ok
-}
+func (br *bitReader) skip(n int) bool { _, ok := br.u(n); return ok }
 func (br *bitReader) ue() (uint, bool) {
 	var leadingZeros int
 	for {
