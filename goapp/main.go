@@ -392,7 +392,44 @@ func main() {
 	// 進階 log 格式（含毫秒與檔名:行號）
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	log.SetOutput(io.Discard)
-	// 基礎 HTTP/除錯
+
+	// 初始化 HTTP 路由與服務
+	initHTTP()
+
+	// 連線並設定 ADB / scrcpy
+	videoStream, controlStream, err := connectToDevice()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		if videoStream != nil {
+			videoStream.Close()
+		}
+		if controlStream != nil {
+			if c, ok := controlStream.(io.Closer); ok {
+				c.Close()
+			}
+		}
+	}()
+
+	controlConn = controlStream
+
+	// 控制通道讀回解析
+	goSafe("control-reader", func() { readDeviceMessages(controlConn) })
+
+	// control 健康檢查
+	goSafe("control-health", startControlHealthLoop)
+
+	log.Println("[VIDEO] 開始接收視訊串流")
+
+	// 開始讀視訊處理迴圈（會在內部處理 header 與幀迴圈）
+	startVideoLoop(videoStream)
+
+	select {}
+}
+
+// initHTTP 設定 HTTP 路由與啟動 server
+func initHTTP() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.ServeFile(w, r, "index.html")
@@ -414,59 +451,55 @@ func main() {
 		srv := &http.Server{Addr: addr}
 		log.Fatal(srv.ListenAndServe())
 	})
+}
 
-	// 連線到第一台 Android 裝置
+// connectToDevice 連線到 Android 裝置並啟動 scrcpy server，回傳 video/control streams
+func connectToDevice() (io.ReadCloser, io.ReadWriter, error) {
 	dev, err := adb.NewDevice("")
 	if err != nil {
-		log.Fatal("[ADB] NewDevice:", err)
+		return nil, nil, fmt.Errorf("[ADB] NewDevice: %w", err)
 	}
 	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", adb.ScrcpyPort)); err != nil {
-		log.Fatal("[ADB] reverse:", err)
+		return nil, nil, fmt.Errorf("[ADB] reverse: %w", err)
 	}
 	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
-		log.Fatal("[ADB] push server:", err)
+		return nil, nil, fmt.Errorf("[ADB] push server: %w", err)
 	}
 	conn, err := dev.StartServer()
 	if err != nil {
-		log.Fatal("[ADB] start server:", err)
+		return nil, nil, fmt.Errorf("[ADB] start server: %w", err)
 	}
-	defer conn.VideoStream.Close()
-	defer conn.Control.Close()
-	controlConn = conn.Control
 	log.Println("[ADB] 已連上 scrcpy server")
+	return conn.VideoStream, conn.Control, nil
+}
 
-	// 控制通道讀回解析：避免阻塞、可觀測是否有裝置回傳（像 clipboard）
-	goSafe("control-reader", func() {
-		readDeviceMessages(controlConn)
-	})
-
-	// 週期性 control 健康檢查（必要時送 GET_CLIPBOARD 當心跳）
-	goSafe("control-health", func() {
-		t := time.NewTicker(controlHealthTick)
-		defer t.Stop()
-		for range t.C {
-			if controlConn == nil {
-				continue
-			}
-			ms := time.Since(lastCtrlRead).Milliseconds()
-			if ms < 0 {
-				ms = 0
-			}
-			evLastCtrlReadMsAgo.Set(ms)
-
-			if time.Since(lastCtrlRead) > controlStaleAfter {
-				// 送一個 GET_CLIPBOARD 促使 server 回傳，確認雙向通暢
-				sendGetClipboard(0) // copyKey=COPY_KEY_NONE
-				evHeartbeatSent.Add(1)
-			}
+// startControlHealthLoop 週期性檢查 control 讀回，必要時發送 GET_CLIPBOARD 心跳
+func startControlHealthLoop() {
+	t := time.NewTicker(controlHealthTick)
+	defer t.Stop()
+	for range t.C {
+		if controlConn == nil {
+			continue
 		}
-	})
+		ms := time.Since(lastCtrlRead).Milliseconds()
+		if ms < 0 {
+			ms = 0
+		}
+		evLastCtrlReadMsAgo.Set(ms)
 
-	log.Println("[VIDEO] 開始接收視訊串流")
+		if time.Since(lastCtrlRead) > controlStaleAfter {
+			// 送一個 GET_CLIPBOARD 促使 server 回傳，確認雙向通暢
+			sendGetClipboard(0) // copyKey=COPY_KEY_NONE
+			evHeartbeatSent.Add(1)
+		}
+	}
+}
 
+// startVideoLoop 處理視訊 header 與接收幀迴圈
+func startVideoLoop(videoStream io.ReadCloser) {
 	// 跳過裝置名稱 (64 bytes, NUL 結尾)
 	nameBuf := make([]byte, 64)
-	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
+	if _, err := io.ReadFull(videoStream, nameBuf); err != nil {
 		log.Fatal("[VIDEO] read device name:", err)
 	}
 	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
@@ -474,7 +507,7 @@ func main() {
 
 	// 視訊標頭 (12 bytes)：[codecID(u32)][w(u32)][h(u32)]
 	vHeader := make([]byte, 12)
-	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
+	if _, err := io.ReadFull(videoStream, vHeader); err != nil {
 		log.Fatal("[VIDEO] read video header:", err)
 	}
 	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（依版本可能不同）
@@ -498,7 +531,7 @@ func main() {
 	for {
 		// frame meta
 		t0 := time.Now()
-		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
+		if _, err := io.ReadFull(videoStream, meta); err != nil {
 			log.Println("[VIDEO] read frame meta:", err)
 			break
 		}
@@ -522,7 +555,7 @@ func main() {
 		// frame data
 		t1 := time.Now()
 		frame := make([]byte, frameSize)
-		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
+		if _, err := io.ReadFull(videoStream, frame); err != nil {
 			log.Println("[VIDEO] read frame:", err)
 			break
 		}
