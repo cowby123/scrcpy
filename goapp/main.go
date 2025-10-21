@@ -86,6 +86,9 @@ var (
 	videoW uint16
 	videoH uint16
 
+	// ADB 目標設備
+	adbTarget string
+
 	// 指標按鍵狀態（用於 mouse action_button 計算）
 	pointerMu      sync.Mutex
 	pointerButtons = make(map[uint64]uint32)
@@ -391,40 +394,21 @@ func handleTouchEvent(ev touchEvent) {
 func main() {
 	// 進階 log 格式（含毫秒與檔名:行號）
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	log.SetOutput(io.Discard)
+	// 暫時開啟日誌以便偵錯
+	// log.SetOutput(io.Discard)
+
+	// 初始化 ADB 目標（空字串表示預設設備）
+	adbTarget = ""
+
+	log.Println("🚀 啟動 scrcpy WebRTC 服務...")
 
 	// 初始化 HTTP 路由與服務
 	initHTTP()
 
-	// 連線並設定 ADB / scrcpy
-	videoStream, controlStream, err := connectToDevice()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		if videoStream != nil {
-			videoStream.Close()
-		}
-		if controlStream != nil {
-			if c, ok := controlStream.(io.Closer); ok {
-				c.Close()
-			}
-		}
-	}()
+	log.Println("✅ HTTP 服務已啟動，請開啟瀏覽器訪問 http://127.0.0.1:8080")
+	log.Println("💡 ADB 連線將在前端觸發時建立")
 
-	controlConn = controlStream
-
-	// 控制通道讀回解析
-	goSafe("control-reader", func() { readDeviceMessages(controlConn) })
-
-	// control 健康檢查
-	goSafe("control-health", startControlHealthLoop)
-
-	log.Println("[VIDEO] 開始接收視訊串流")
-
-	// 開始讀視訊處理迴圈（會在內部處理 header 與幀迴圈）
-	startVideoLoop(videoStream)
-
+	// 保持程式運行
 	select {}
 }
 
@@ -438,6 +422,7 @@ func initHTTP() {
 		http.FileServer(http.Dir(".")).ServeHTTP(w, r)
 	})
 	http.HandleFunc("/offer", handleOffer)
+	http.HandleFunc("/set-adb-target", handleSetAdbTarget)
 	http.HandleFunc("/debug/stack", func(w http.ResponseWriter, r *http.Request) {
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
@@ -455,9 +440,9 @@ func initHTTP() {
 
 // connectToDevice 連線到 Android 裝置並啟動 scrcpy server，回傳 video/control streams
 func connectToDevice() (io.ReadCloser, io.ReadWriter, error) {
-	dev, err := adb.NewDevice("")
+	dev, err := adb.NewDevice(adbTarget)
 	if err != nil {
-		return nil, nil, fmt.Errorf("[ADB] NewDevice: %w", err)
+		return nil, nil, fmt.Errorf("[ADB] NewDevice(%s): %w", adbTarget, err)
 	}
 	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", adb.ScrcpyPort)); err != nil {
 		return nil, nil, fmt.Errorf("[ADB] reverse: %w", err)
@@ -521,6 +506,14 @@ func startVideoLoop(videoStream io.ReadCloser) {
 	evVideoH.Set(int64(videoH))
 
 	log.Printf("[VIDEO] 編碼ID: %d, 初始解析度: %dx%d", codecID, w0, h0)
+
+	// 視訊流已準備就緒，現在可以安全地請求關鍵幀
+	log.Println("[VIDEO] 視訊流初始化完成，請求初始關鍵幀...")
+	go func() {
+		time.Sleep(500 * time.Millisecond) // 短暫延遲確保一切就緒
+		requestKeyframe()
+		evKeyframeRequests.Add(1)
+	}()
 
 	// 接收幀迴圈（多數版本：meta 12 bytes：[PTS(u64)] + [size(u32)]）
 	meta := make([]byte, 12)
@@ -700,6 +693,34 @@ func startVideoLoop(videoStream io.ReadCloser) {
 	}
 }
 
+// === HTTP: /set-adb-target handler ===
+func handleSetAdbTarget(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Target string `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.Lock()
+	adbTarget = req.Target
+	stateMu.Unlock()
+
+	log.Printf("[ADB] 目標已設定為: %s", adbTarget)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"target": adbTarget,
+	})
+}
+
 // === WebRTC: /offer handler ===
 func handleOffer(w http.ResponseWriter, r *http.Request) {
 	var offer webrtc.SessionDescription
@@ -707,6 +728,40 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid offer", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("🔌 收到 WebRTC offer，開始建立 ADB 連線 (目標: %s)", adbTarget)
+
+	// 建立 ADB 連線
+	videoStream, controlStream, err := connectToDevice()
+	if err != nil {
+		log.Printf("❌ ADB 連線失敗: %v", err)
+		http.Error(w, fmt.Sprintf("ADB connection failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("✅ ADB 連線成功，開始設定 WebRTC")
+
+	// 設定全域控制連線
+	controlConn = controlStream
+
+	// 啟動控制通道處理
+	goSafe("control-reader", func() {
+		defer func() {
+			if c, ok := controlStream.(io.Closer); ok {
+				c.Close()
+			}
+		}()
+		readDeviceMessages(controlConn)
+	})
+
+	// 啟動控制健康檢查
+	goSafe("control-health", startControlHealthLoop)
+
+	// 啟動視訊處理
+	goSafe("video-loop", func() {
+		defer videoStream.Close()
+		startVideoLoop(videoStream)
+	})
 
 	// 媒體編解碼：H.264 packetization-mode=1
 	m := webrtc.MediaEngine{}
@@ -875,9 +930,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	rtpTS0 = 0
 	stateMu.Unlock()
 
-	// 立刻請求關鍵幀
-	requestKeyframe()
-	evKeyframeRequests.Add(1)
+	log.Println("[WebRTC] packetizer 初始化完成，等待視訊流請求關鍵幀...")
 
 	// 回傳 Answer（含 ICE）
 	w.Header().Set("Content-Type", "application/json")
@@ -887,13 +940,21 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 // 要求 Android 重新送出關鍵幀
 func requestKeyframe() {
 	if controlConn == nil {
+		log.Println("[CTRL] requestKeyframe: controlConn is nil")
 		return
 	}
 	controlMu.Lock()
 	defer controlMu.Unlock()
+	
+	// 添加寫入超時以避免阻塞
+	if conn, ok := controlConn.(net.Conn); ok {
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		defer conn.SetWriteDeadline(time.Time{}) // 清除超時
+	}
+	
 	// 控制訊息：TYPE_RESET_VIDEO 僅 1 byte
 	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
-		log.Println("[CTRL] send RESET_VIDEO:", err)
+		log.Printf("[CTRL] send RESET_VIDEO failed: %v", err)
 	} else {
 		log.Println("[CTRL] 已送出 RESET_VIDEO")
 	}

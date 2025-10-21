@@ -27,6 +27,8 @@
     .row { display:flex; gap:8px; align-items:center; justify-content:center; flex-wrap:wrap; }
     button { padding:10px 16px; border-radius:10px; border:1px solid #333; background:#1f1f1f; color:#ddd; cursor:pointer; }
     button:hover { background:#262626; }
+    input[type="text"] { padding:10px 12px; border-radius:10px; border:1px solid #333; background:#1b1b1b; color:#ddd; min-width:220px; }
+    input[type="text"]::placeholder { color:#777; }
     pre { width:min(92vw, 900px); max-height:22vh; overflow:auto; background:#0c0c0c; color:#bbb; border:1px solid #222; border-radius:10px; padding:10px; }
   </style>
 </head>
@@ -41,6 +43,7 @@
          controlslist="nodownload noplaybackrate noremoteplayback nofullscreen"></video>
 
   <div class="row">
+    <input id="adbTarget" type="text" placeholder="ADB 目標（例如 192.168.1.10:5555）" aria-label="adb target" />
     <button id="btnStart">開始連線</button>
     <button id="btnStop" disabled>中斷連線</button>
     <button id="btnReconnectAndroid">重新連接 Android</button>
@@ -238,6 +241,22 @@
         $("#btnStop").disabled = false;
         forceStop = false;
 
+        // 設定 ADB 目標
+        const adbTargetValue = $("#adbTarget").value.trim();
+        if (adbTargetValue) {
+          log(`設定 ADB 目標: ${adbTargetValue}`);
+          const targetResp = await fetch("/set-adb-target", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target: adbTargetValue }),
+          });
+          if (!targetResp.ok) {
+            throw new Error(`設定 ADB 目標失敗: ${targetResp.status} ${targetResp.statusText}`);
+          }
+          const targetResult = await targetResp.json();
+          log(`ADB 目標已設定: ${targetResult.target}`);
+        }
+
         pc = new RTCPeerConnection();
 
         // 控制用雙通道
@@ -321,6 +340,11 @@
 
     $("#btnStart").addEventListener("click", start);
     $("#btnStop").addEventListener("click", stop);
+    $("#btnReconnectAndroid").addEventListener("click", async () => {
+      log("重新連接 Android...");
+      await stop();
+      setTimeout(start, 1000); // 等待 1 秒後重連
+    });
 
     // 自動嘗試連線
     start();
