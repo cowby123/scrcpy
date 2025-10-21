@@ -610,59 +610,54 @@ func startVideoLoop(videoStream io.ReadCloser) {
 
 		// 推進 WebRTC
 		if vt != nil && pk != nil {
-			// 若剛換解析度，先送 SPS/PPS，並請 IDR
+			// 若剛換解析度，只是標記需要關鍵幀，不立即發送 SPS/PPS
 			if gotNewSPS {
-				stateMu.RLock()
-				sps := lastSPS
-				pps := lastPPS
-				stateMu.RUnlock()
-				if len(sps) > 0 {
-					sendNALUsAtTS(curTS, sps)
-				}
-				if len(pps) > 0 {
-					sendNALUsAtTS(curTS, pps)
-				}
-				waitKF = true
+				log.Printf("[AU] 偵測到新 SPS，標記需要關鍵幀")
 				stateMu.Lock()
 				needKeyframe = true
 				stateMu.Unlock()
 				requestKeyframe()
 				evKeyframeRequests.Add(1)
+				waitKF = true // 更新本地狀態
 			}
 
 			if waitKF {
-				stateMu.RLock()
-				sps := lastSPS
-				pps := lastPPS
-				stateMu.RUnlock()
-
-				if len(sps) > 0 && len(pps) > 0 {
-					sendNALUsAtTS(curTS, sps, pps)
-				} else {
-					requestKeyframe()
-					evKeyframeRequests.Add(1)
-				}
-
 				framesSinceKF++
 				evFramesSinceKF.Set(int64(framesSinceKF))
-				if framesSinceKF%30 == 0 {
-					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
-					requestKeyframe()
-					evKeyframeRequests.Add(1)
-				}
 
 				if !idrInThisAU {
-					goto stats
+					// 等待 IDR 期間，每 30 幀重新請求一次關鍵幀
+					if framesSinceKF%30 == 0 {
+						log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
+						requestKeyframe()
+						evKeyframeRequests.Add(1)
+					}
+					goto stats // 跳過發送，繼續等待 IDR
 				}
 
-				log.Println("[KF] 偵測到 IDR，開始送流")
+				// 收到 IDR，發送完整的 Access Unit (SPS + PPS + IDR + ...)
+				log.Println("[KF] 偵測到 IDR，發送完整 Access Unit")
 				stateMu.Lock()
 				needKeyframe = false
 				framesSinceKF = 0
 				stateMu.Unlock()
 				evFramesSinceKF.Set(0)
 
-				sendNALUAccessUnitAtTS(nalus, curTS)
+				// 先發送 SPS/PPS，再發送整個 AU
+				stateMu.RLock()
+				sps := lastSPS
+				pps := lastPPS
+				stateMu.RUnlock()
+
+				if len(sps) > 0 && len(pps) > 0 {
+					// 將 SPS/PPS 與當前 AU 合併發送
+					completeAU := make([][]byte, 0, len(nalus)+2)
+					completeAU = append(completeAU, sps, pps)
+					completeAU = append(completeAU, nalus...)
+					sendNALUAccessUnitAtTS(completeAU, curTS)
+				} else {
+					sendNALUAccessUnitAtTS(nalus, curTS)
+				}
 			} else {
 				sendNALUAccessUnitAtTS(nalus, curTS)
 			}
@@ -945,13 +940,13 @@ func requestKeyframe() {
 	}
 	controlMu.Lock()
 	defer controlMu.Unlock()
-	
+
 	// 添加寫入超時以避免阻塞
 	if conn, ok := controlConn.(net.Conn); ok {
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		defer conn.SetWriteDeadline(time.Time{}) // 清除超時
 	}
-	
+
 	// 控制訊息：TYPE_RESET_VIDEO 僅 1 byte
 	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
 		log.Printf("[CTRL] send RESET_VIDEO failed: %v", err)
@@ -1085,14 +1080,15 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 	if pk == nil || vt == nil {
 		return
 	}
-	for _, n := range nalus {
+	for i, n := range nalus {
 		if len(n) == 0 {
 			continue
 		}
 		pkts := pk.Packetize(n, 0)
-		for _, p := range pkts {
+		for j, p := range pkts {
 			p.Timestamp = ts
-			p.Marker = false
+			// 最後一個 NALU 的最後一個封包才設 marker
+			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("[RTP] write error:", err)
 			}
