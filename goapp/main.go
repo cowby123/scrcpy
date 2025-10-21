@@ -68,8 +68,9 @@ var (
 	startTime     time.Time // 速率統計
 	controlConn   io.ReadWriter
 	controlMu     sync.Mutex
-	lastCtrlRead  time.Time // 最近一次從 control socket 讀到裝置訊息
-	lastCtrlWrite time.Time // 最近一次成功寫入 control
+	keyframeMu    sync.Mutex // 關鍵幀處理互斥鎖
+	lastCtrlRead  time.Time  // 最近一次從 control socket 讀到裝置訊息
+	lastCtrlWrite time.Time  // 最近一次成功寫入 control
 
 	// 觀測 PLI/FIR 與 AU 序號
 	lastPLI       time.Time
@@ -118,6 +119,8 @@ var (
 	evLastFrameReadMS    = expvar.NewInt("last_frame_read_ms")
 	evAuSeq              = expvar.NewInt("au_seq")
 	evFramesSinceKF      = expvar.NewInt("frames_since_kf")
+	evRTPPacketsSent     = expvar.NewInt("rtp_packets_sent")
+	evRTPWriteErrors     = expvar.NewInt("rtp_write_errors")
 	evPendingPointers    = expvar.NewInt("pending_pointers")
 	evActivePeer         = expvar.NewInt("active_peer") // 0/1
 	evLastCtrlReadMsAgo  = expvar.NewInt("last_control_read_ms_ago")
@@ -622,6 +625,7 @@ func startVideoLoop(videoStream io.ReadCloser) {
 			}
 
 			if waitKF {
+				keyframeMu.Lock() // 確保關鍵幀處理不被 RTCP 中斷
 				framesSinceKF++
 				evFramesSinceKF.Set(int64(framesSinceKF))
 
@@ -632,6 +636,7 @@ func startVideoLoop(videoStream io.ReadCloser) {
 						requestKeyframe()
 						evKeyframeRequests.Add(1)
 					}
+					keyframeMu.Unlock()
 					goto stats // 跳過發送，繼續等待 IDR
 				}
 
@@ -643,21 +648,37 @@ func startVideoLoop(videoStream io.ReadCloser) {
 				stateMu.Unlock()
 				evFramesSinceKF.Set(0)
 
-				// 先發送 SPS/PPS，再發送整個 AU
-				stateMu.RLock()
-				sps := lastSPS
-				pps := lastPPS
-				stateMu.RUnlock()
+				// 檢查當前 AU 是否已包含 SPS/PPS
+				hasSPSInAU := spsCnt > 0
+				hasPPSInAU := ppsCnt > 0
 
-				if len(sps) > 0 && len(pps) > 0 {
-					// 將 SPS/PPS 與當前 AU 合併發送
-					completeAU := make([][]byte, 0, len(nalus)+2)
-					completeAU = append(completeAU, sps, pps)
-					completeAU = append(completeAU, nalus...)
-					sendNALUAccessUnitAtTS(completeAU, curTS)
+				if !hasSPSInAU || !hasPPSInAU {
+					// 當前 AU 缺少參數集，需要添加
+					stateMu.RLock()
+					sps := lastSPS
+					pps := lastPPS
+					stateMu.RUnlock()
+
+					if len(sps) > 0 && len(pps) > 0 {
+						completeAU := make([][]byte, 0, len(nalus)+2)
+						if !hasSPSInAU {
+							completeAU = append(completeAU, sps)
+						}
+						if !hasPPSInAU {
+							completeAU = append(completeAU, pps)
+						}
+						completeAU = append(completeAU, nalus...)
+						sendNALUAccessUnitAtTS(completeAU, curTS)
+					} else {
+						log.Printf("[KF] 警告：無有效 SPS/PPS，直接發送 IDR AU")
+						sendNALUAccessUnitAtTS(nalus, curTS)
+					}
 				} else {
+					// AU 已包含完整參數集，直接發送
+					log.Printf("[KF] AU 已包含 SPS/PPS，直接發送")
 					sendNALUAccessUnitAtTS(nalus, curTS)
 				}
+				keyframeMu.Unlock()
 			} else {
 				sendNALUAccessUnitAtTS(nalus, curTS)
 			}
@@ -812,26 +833,42 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			for _, pkt := range pkts {
 				switch p := pkt.(type) {
 				case *rtcp.PictureLossIndication:
+					keyframeMu.Lock()
 					stateMu.Lock()
-					needKeyframe = true
-					lastPLI = time.Now()
-					pliCount++
-					stateMu.Unlock()
-					evRTCP_PLI.Add(1)
-					evPLICount.Set(int64(pliCount))
-					requestKeyframe()
-					evKeyframeRequests.Add(1)
+					// 避免重複請求：如果已經在等待關鍵幀，則跳過
+					if !needKeyframe {
+						needKeyframe = true
+						lastPLI = time.Now()
+						pliCount++
+						stateMu.Unlock()
+						evRTCP_PLI.Add(1)
+						evPLICount.Set(int64(pliCount))
+						log.Printf("[RTCP] 收到 PLI，請求關鍵幀")
+						requestKeyframe()
+						evKeyframeRequests.Add(1)
+					} else {
+						stateMu.Unlock()
+						log.Printf("[RTCP] 收到 PLI，但已在等待關鍵幀中，跳過")
+					}
+					keyframeMu.Unlock()
 				case *rtcp.FullIntraRequest:
-					log.Printf("[RTCP] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", p.SenderSSRC, p.MediaSSRC)
+					keyframeMu.Lock()
 					stateMu.Lock()
-					needKeyframe = true
-					lastPLI = time.Now()
-					pliCount++
-					stateMu.Unlock()
-					evRTCP_FIR.Add(1)
-					evPLICount.Set(int64(pliCount))
-					requestKeyframe()
-					evKeyframeRequests.Add(1)
+					if !needKeyframe {
+						needKeyframe = true
+						lastPLI = time.Now()
+						pliCount++
+						stateMu.Unlock()
+						evRTCP_FIR.Add(1)
+						evPLICount.Set(int64(pliCount))
+						log.Printf("[RTCP] 收到 FIR，請求關鍵幀 (SenderSSRC=%d, MediaSSRC=%d)", p.SenderSSRC, p.MediaSSRC)
+						requestKeyframe()
+						evKeyframeRequests.Add(1)
+					} else {
+						stateMu.Unlock()
+						log.Printf("[RTCP] 收到 FIR，但已在等待關鍵幀中，跳過")
+					}
+					keyframeMu.Unlock()
 				}
 			}
 		}
@@ -1067,7 +1104,10 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 			p.Timestamp = ts
 			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
 			if err := vt.WriteRTP(p); err != nil {
-				log.Println("[RTP] write error:", err)
+				log.Printf("[RTP] write error: %v (seq=%d, ts=%d)", err, p.SequenceNumber, p.Timestamp)
+				evRTPWriteErrors.Add(1)
+			} else {
+				evRTPPacketsSent.Add(1)
 			}
 		}
 	}
