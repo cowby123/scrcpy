@@ -474,29 +474,16 @@ func main() {
 		log.Fatal(srv.ListenAndServe())
 	})
 
-	// === 5. 建立與 Android 設備的連接 ===
-	// 取得 ADB 配置選項
+	// === 5. ???P Android ?]????s?? ===
 	deviceOpts := getADBOptions()
-	// 建立新的 scrcpy 會話
-	session := NewScrcpySession(deviceOpts)
-	// 啟動 scrcpy 連接（包含 ADB 設定、端口轉發、啟動 scrcpy server 等）
-	if err := session.Start(); err != nil {
+	session, conn, err := StartScrcpyBoot(deviceOpts)
+	if err != nil {
 		log.Fatal("[ADB] setup:", err)
 	}
-	// 設定全域會話並確保程式結束時正確關閉
 	scrcpySession = session
 	defer scrcpySession.Close()
-
-	// 取得連接資訊並驗證連接狀態
-	scrcpyPort := scrcpySession.ScrcpyPort()
-	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpyPort)
-	conn := scrcpySession.Conn()
-	if conn == nil {
-		log.Fatal("[ADB] scrcpy connection not established")
-	}
-	// 啟動控制迴圈（處理控制指令發送和設備訊息接收）
-	scrcpySession.StartControlLoops()
-	log.Println("[ADB] scrcpy server 連接成功")
+	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpySession.ScrcpyPort())
+	log.Println("[ADB] scrcpy server ?s?????")
 
 	// === 6. 啟動 RTP 發送器 ===
 	// 啟動專門的 goroutine 處理 RTP 封包發送，與視訊讀取解耦合

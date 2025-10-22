@@ -28,6 +28,20 @@ func NewScrcpySession(opts adb.Options) *ScrcpySession {
 	return &ScrcpySession{opts: opts}
 }
 
+// StartScrcpyBoot creates, starts, and initializes a ScrcpySession.
+func StartScrcpyBoot(opts adb.Options) (*ScrcpySession, *adb.ServerConn, error) {
+	session := NewScrcpySession(opts)
+	if err := session.Start(); err != nil {
+		return nil, nil, err
+	}
+	conn := session.Conn()
+	if conn == nil {
+		return nil, nil, fmt.Errorf("scrcpy connection not established")
+	}
+	session.StartControlLoops()
+	return session, conn, nil
+}
+
 // Start establishes the adb connection, launches scrcpy on device, and wires streams.
 func (s *ScrcpySession) Start() error {
 	dev, err := adb.NewDevice(s.opts)
