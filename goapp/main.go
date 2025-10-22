@@ -2,6 +2,8 @@
 // 觸控 ≤10 指映射；mouse/pen 固定用 ID 0；忽略滑鼠 hover move；
 // DataChannel 收到控制訊號時印出原始資料並照官方順序編碼後直寫 control socket。
 // ★ 新增：control socket 讀回解析（DeviceMessage：clipboard）、心跳 GET_CLIPBOARD、寫入 deadline/耗時告警。
+// ★ 效能：解耦 ADB 讀取與 WebRTC 寫入，使用 channel 避免 I/O 阻塞；統一控制寫入 deadline。
+// ★ v3: 縮小 channel 緩衝區以降低延遲。
 
 package main
 
@@ -44,6 +46,12 @@ const (
 	warnFrameReadOver    = 50 * time.Millisecond // 讀 frame data >50ms
 	statsLogEvery        = 100                   // 每 100 幀打印統計
 	keyframeTick         = 5 * time.Second       // 週期性請求關鍵幀
+
+	// ★ [v3] 效能調校：使用一個非常小的緩衝區 (類似官方 scrcpy 的 1 幀緩衝)
+	// 優先保證低延遲，而不是播放平順。這會更積極地丟幀。
+	rtpPayloadChannelSize = 3
+
+	controlWriteDefaultTimeout = 50 * time.Millisecond // ★ 控制請求 (PLI/HB) deadline
 
 	// control 心跳與讀回監控
 	controlHealthTick      = 5 * time.Second  // 每 5s 檢查一次讀回
@@ -119,7 +127,44 @@ var (
 	evActivePeer         = expvar.NewInt("active_peer") // 0/1
 	evLastCtrlReadMsAgo  = expvar.NewInt("last_control_read_ms_ago")
 	evHeartbeatSent      = expvar.NewInt("control_heartbeat_sent")
+	evFramesDropped      = expvar.NewInt("frames_dropped_on_send") // ★ 新增：觀測發送端丟幀
 )
+
+// ====== ★ 解耦 Video 讀/寫 ======
+type RtpPayload struct {
+	NALUs        [][]byte
+	RTPTimestamp uint32
+	IsAccessUnit bool // 標記這是否是一個完整的 AU (Access Unit)，用於設定 RTP Marker bit
+}
+
+// ★ [v3] 使用了縮小後的 channel size
+var frameChannel = make(chan RtpPayload, rtpPayloadChannelSize)
+
+// ★ 推送至 RTP channel，若壅塞則丟棄
+func pushToRTPChannel(payload RtpPayload) {
+	select {
+	case frameChannel <- payload:
+		// 成功推入
+	default:
+		// Channel 滿了，代表 WebRTC 端處理不過來
+		// 為了降低延遲，**主動丟棄**
+		log.Printf("[RTP] 寫入壅塞 (channel 滿)，丟棄 %d NALUs (isAU=%v)", len(payload.NALUs), payload.IsAccessUnit)
+		evFramesDropped.Add(1)
+	}
+}
+
+// ★ 清空 RTP channel (WebRTC 斷線時)
+func clearFrameChannel() {
+	for {
+		select {
+		case <-frameChannel:
+			// 丟棄
+		default:
+			// channel 空了
+			return
+		}
+	}
+}
 
 // ====== 工具：安全啟動 goroutine，避免 panic 默默死掉 ======
 func goSafe(name string, fn func()) {
@@ -175,9 +220,10 @@ func freeLocalSlot(remote uint64) {
 }
 
 // 寫入控制 socket：**一定寫完整個封包**，並可選設置 write deadline（避免長時間阻塞）
-func writeFull(b []byte, deadline time.Duration, setDeadline bool) {
+// ★ 修改：回傳 error
+func writeFull(b []byte, deadline time.Duration, setDeadline bool) error {
 	if controlConn == nil || len(b) == 0 {
-		return
+		return nil
 	}
 	start := time.Now()
 	controlMu.Lock()
@@ -190,6 +236,15 @@ func writeFull(b []byte, deadline time.Duration, setDeadline bool) {
 		}
 	}
 
+	// ★ 確保 deadline 在函式退出時被清除
+	defer func() {
+		if setDeadline {
+			if c, ok := controlConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				_ = c.SetWriteDeadline(time.Time{})
+			}
+		}
+	}()
+
 	total := 0
 	for total < len(b) {
 		n, err := controlConn.Write(b[total:])
@@ -198,7 +253,7 @@ func writeFull(b []byte, deadline time.Duration, setDeadline bool) {
 			evCtrlWritesErr.Add(1)
 			log.Printf("[CTRL] write error after %d/%d bytes (elapsed=%v, deadline=%v): %v",
 				total, len(b), time.Since(start), setDeadline, err)
-			return
+			return err // ★ 回傳錯誤
 		}
 	}
 	elapsed := time.Since(start)
@@ -208,12 +263,8 @@ func writeFull(b []byte, deadline time.Duration, setDeadline bool) {
 	if elapsed > warnCtrlWriteOver {
 		log.Printf("[CTRL] write 慢 (%v) deadline=%v size=%d", elapsed, setDeadline, len(b))
 	}
-	// 若曾設置 deadline，寫完後清掉（避免影響其他操作）
-	if setDeadline {
-		if c, ok := controlConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			_ = c.SetWriteDeadline(time.Time{})
-		}
-	}
+
+	return nil // ★ 成功
 }
 
 // ====== 前端事件（JSON）→ 官方線路格式（32 bytes）======
@@ -360,8 +411,8 @@ func handleTouchEvent(ev touchEvent) {
 	}
 
 	// ====== 官方線路格式（總 32 bytes）======
-	// [0]    : type = 2 (INJECT_TOUCH_EVENT)
-	// [1]    : action (u8)
+	// [0]    : type = 2 (INJECT_TOUCH_EVENT)
+	// [1]    : action (u8)
 	// [2:10] : pointerId (i64)
 	// [10:14]: x (i32)
 	// [14:18]: y (i32)
@@ -383,7 +434,8 @@ func handleTouchEvent(ev touchEvent) {
 	binary.BigEndian.PutUint32(buf[28:], nowButtons)
 
 	// 像官方：事件到就直接寫 socket（不合併、不延遲）
-	writeFull(buf, criticalWriteTimeout, true)
+	// ★ 修改：忽略 writeFull 的 error (日誌由 writeFull 內部處理)
+	_ = writeFull(buf, criticalWriteTimeout, true)
 }
 
 // ========= 伺服器入口 =========
@@ -391,7 +443,6 @@ func handleTouchEvent(ev touchEvent) {
 func main() {
 	// 進階 log 格式（含毫秒與檔名:行號）
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	log.SetOutput(io.Discard)
 	// 基礎 HTTP/除錯
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -460,6 +511,21 @@ func main() {
 				evHeartbeatSent.Add(1)
 			}
 		}
+	})
+
+	// ★ 啟動 rtp-sender goroutine (解耦 I/O)
+	goSafe("rtp-sender", func() {
+		log.Println("[RTP] rtp-sender 啟動")
+		for payload := range frameChannel {
+			if payload.IsAccessUnit {
+				// 傳送一個完整的 AU (Marker bit 會在最後一個 NALU 的最後一個 packet 上)
+				sendNALUAccessUnitAtTS(payload.NALUs, payload.RTPTimestamp)
+			} else {
+				// 傳送單獨的 NALU (例如 SPS/PPS，不設定 Marker bit)
+				sendNALUsAtTS(payload.RTPTimestamp, payload.NALUs...)
+			}
+		}
+		log.Println("[RTP] rtp-sender 停止")
 	})
 
 	log.Println("[VIDEO] 開始接收視訊串流")
@@ -582,7 +648,7 @@ func main() {
 		waitKF := needKeyframe
 		stateMu.RUnlock()
 
-		// 推進 WebRTC
+		// 推進 WebRTC (★ 改為推送 Channel)
 		if vt != nil && pk != nil {
 			// 若剛換解析度，先送 SPS/PPS，並請 IDR
 			if gotNewSPS {
@@ -590,14 +656,16 @@ func main() {
 				sps := lastSPS
 				pps := lastPPS
 				stateMu.RUnlock()
+				// ★ 推送 SPS/PPS 到 channel
 				if len(sps) > 0 {
-					sendNALUsAtTS(curTS, sps)
+					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				}
 				if len(pps) > 0 {
-					sendNALUsAtTS(curTS, pps)
+					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				}
-				waitKF = true
+
 				stateMu.Lock()
+				waitKF = true // 更新本地副本
 				needKeyframe = true
 				stateMu.Unlock()
 				requestKeyframe()
@@ -611,7 +679,9 @@ func main() {
 				stateMu.RUnlock()
 
 				if len(sps) > 0 && len(pps) > 0 {
-					sendNALUsAtTS(curTS, sps, pps)
+					// ★ 推送 SPS+PPS 到 channel (分開推)
+					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
+					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				} else {
 					requestKeyframe()
 					evKeyframeRequests.Add(1)
@@ -626,7 +696,7 @@ func main() {
 				}
 
 				if !idrInThisAU {
-					goto stats
+					goto stats // ★ 丟棄非 IDR 幀 (不推送)
 				}
 
 				log.Println("[KF] 偵測到 IDR，開始送流")
@@ -636,9 +706,11 @@ func main() {
 				stateMu.Unlock()
 				evFramesSinceKF.Set(0)
 
-				sendNALUAccessUnitAtTS(nalus, curTS)
+				// ★ 推送 IDR (AU) 到 Channel
+				pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
 			} else {
-				sendNALUAccessUnitAtTS(nalus, curTS)
+				// ★ 推送 P 幀 (AU) 到 Channel
+				pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
 			}
 		}
 
@@ -654,9 +726,10 @@ func main() {
 			stateMu.RLock()
 			lp := lastPLI
 			pc := pliCount
+			dropped := evFramesDropped.Value()
 			stateMu.RUnlock()
-			log.Printf("[STATS] 影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s), AUseq=%d",
-				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339), auSeq)
+			log.Printf("[STATS] 影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s), AUseq=%d, 丟幀(w): %d",
+				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339), auSeq, dropped)
 		}
 
 		// 下一 AU 序號
@@ -729,6 +802,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			for _, pkt := range pkts {
 				switch p := pkt.(type) {
 				case *rtcp.PictureLossIndication:
+					log.Println("[RTCP] 收到 PLI → needKeyframe = true")
 					stateMu.Lock()
 					needKeyframe = true
 					lastPLI = time.Now()
@@ -805,6 +879,10 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			packetizer = nil
 			stateMu.Unlock()
 			evActivePeer.Set(0)
+
+			// ★ 清空 channel，避免 main 迴圈阻塞並累積舊幀
+			log.Println("[RTP] WebRTC 斷線，清空 frameChannel")
+			clearFrameChannel()
 		}
 	})
 
@@ -852,30 +930,29 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 }
 
 // 要求 Android 重新送出關鍵幀
+// ★ 修改：使用 writeFull 並設定 deadline
 func requestKeyframe() {
 	if controlConn == nil {
 		return
 	}
-	controlMu.Lock()
-	defer controlMu.Unlock()
-	// 控制訊息：TYPE_RESET_VIDEO 僅 1 byte
-	if _, err := controlConn.Write([]byte{controlMsgResetVideo}); err != nil {
-		log.Println("[CTRL] send RESET_VIDEO:", err)
+	// ★ 使用 writeFull，它內部會鎖 controlMu。設定 50ms deadline。
+	if err := writeFull([]byte{controlMsgResetVideo}, controlWriteDefaultTimeout, true); err != nil {
+		// writeFull 內部已打印詳細錯誤
+		log.Println("[CTRL] send RESET_VIDEO 失敗")
 	} else {
 		log.Println("[CTRL] 已送出 RESET_VIDEO")
 	}
 }
 
 // 主動向 server 要求回傳剪貼簿（作為健康心跳）
+// ★ 修改：使用 writeFull 並設定 deadline
 func sendGetClipboard(copyKey byte) {
 	if controlConn == nil {
 		return
 	}
-	controlMu.Lock()
-	defer controlMu.Unlock()
-	// [type=8][copyKey=1B]
-	if _, err := controlConn.Write([]byte{controlMsgGetClipboard, copyKey}); err != nil {
-		log.Println("[CTRL] send GET_CLIPBOARD:", err)
+	// ★ 使用 writeFull，它內部會鎖 controlMu。設定 50ms deadline。
+	if err := writeFull([]byte{controlMsgGetClipboard, copyKey}, controlWriteDefaultTimeout, true); err != nil {
+		log.Println("[CTRL] send GET_CLIPBOARD 失敗")
 	} else {
 		log.Println("[CTRL] 已送出 GET_CLIPBOARD (heartbeat)")
 	}
@@ -961,6 +1038,7 @@ func trimString(s string, max int) string {
 }
 
 // === RTP 發送（以指定 TS）===
+// ★ 注意：這些函式現在由 'rtp-sender' goroutine 唯一呼叫
 func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
@@ -976,7 +1054,7 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 		pkts := pk.Packetize(n, 0) // samples=0，手動覆寫 Timestamp
 		for j, p := range pkts {
 			p.Timestamp = ts
-			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1)
+			p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1) // ★ Marker bit
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("[RTP] write error:", err)
 			}
@@ -998,7 +1076,7 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 		pkts := pk.Packetize(n, 0)
 		for _, p := range pkts {
 			p.Timestamp = ts
-			p.Marker = false
+			p.Marker = false // ★ 非 AU 結尾
 			if err := vt.WriteRTP(p); err != nil {
 				log.Println("[RTP] write error:", err)
 			}
