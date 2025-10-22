@@ -17,7 +17,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"net"
 	"net/http"
 	_ "net/http/pprof" // 啟用 /debug/pprof
 	"runtime"
@@ -46,25 +45,6 @@ func registerADBFlags(fs *flag.FlagSet) func() adb.Options {
 			ScrcpyPort: *scrcpyPort,
 		}
 	}
-}
-
-func setupScrcpyDevice(opts adb.Options) (*adb.Device, *adb.ServerConn, error) {
-	dev, err := adb.NewDevice(opts)
-	if err != nil {
-		return nil, nil, fmt.Errorf("new device: %w", err)
-	}
-	port := dev.ScrcpyPort()
-	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", port)); err != nil {
-		return nil, nil, fmt.Errorf("reverse: %w", err)
-	}
-	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
-		return nil, nil, fmt.Errorf("push server: %w", err)
-	}
-	conn, err := dev.StartServer()
-	if err != nil {
-		return nil, nil, fmt.Errorf("start server: %w", err)
-	}
-	return dev, conn, nil
 }
 
 const (
@@ -108,11 +88,7 @@ var (
 
 	stateMu sync.RWMutex
 
-	startTime     time.Time // 速率統計
-	controlConn   io.ReadWriter
-	controlMu     sync.Mutex
-	lastCtrlRead  time.Time // 最近一次從 control socket 讀到裝置訊息
-	lastCtrlWrite time.Time // 最近一次成功寫入 control
+	startTime time.Time // 速率統計
 
 	// 觀測 PLI/FIR 與 AU 序號
 	lastPLI       time.Time
@@ -133,6 +109,8 @@ var (
 	pointerMu      sync.Mutex
 	pointerButtons = make(map[uint64]uint32)
 )
+
+var scrcpySession *ScrcpySession
 
 // ====== 指標（expvar）======
 var (
@@ -256,52 +234,6 @@ func freeLocalSlot(remote uint64) {
 
 // 寫入控制 socket：**一定寫完整個封包**，並可選設置 write deadline（避免長時間阻塞）
 // ★ 修改：回傳 error
-func writeFull(b []byte, deadline time.Duration, setDeadline bool) error {
-	if controlConn == nil || len(b) == 0 {
-		return nil
-	}
-	start := time.Now()
-	controlMu.Lock()
-	defer controlMu.Unlock()
-
-	// 嘗試設置 write deadline（若底層支援）
-	if setDeadline {
-		if c, ok := controlConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			_ = c.SetWriteDeadline(time.Now().Add(deadline))
-		}
-	}
-
-	// ★ 確保 deadline 在函式退出時被清除
-	defer func() {
-		if setDeadline {
-			if c, ok := controlConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-				_ = c.SetWriteDeadline(time.Time{})
-			}
-		}
-	}()
-
-	total := 0
-	for total < len(b) {
-		n, err := controlConn.Write(b[total:])
-		total += n
-		if err != nil {
-			evCtrlWritesErr.Add(1)
-			log.Printf("[CTRL] write error after %d/%d bytes (elapsed=%v, deadline=%v): %v",
-				total, len(b), time.Since(start), setDeadline, err)
-			return err // ★ 回傳錯誤
-		}
-	}
-	elapsed := time.Since(start)
-	lastCtrlWrite = time.Now()
-	evLastCtrlWriteMS.Set(elapsed.Milliseconds())
-	evCtrlWritesOK.Add(1)
-	if elapsed > warnCtrlWriteOver {
-		log.Printf("[CTRL] write 慢 (%v) deadline=%v size=%d", elapsed, setDeadline, len(b))
-	}
-
-	return nil // ★ 成功
-}
-
 // ====== 前端事件（JSON）→ 官方線路格式（32 bytes）======
 type touchEvent struct {
 	Type        string  `json:"type"` // "down" | "up" | "move" | "cancel"
@@ -322,7 +254,7 @@ func handleTouchEvent(ev touchEvent) {
 		pointerMu.Unlock()
 	}()
 
-	if controlConn == nil {
+	if scrcpySession == nil || scrcpySession.ControlConn() == nil {
 		return
 	}
 
@@ -470,7 +402,9 @@ func handleTouchEvent(ev touchEvent) {
 
 	// 像官方：事件到就直接寫 socket（不合併、不延遲）
 	// ★ 修改：忽略 writeFull 的 error (日誌由 writeFull 內部處理)
-	_ = writeFull(buf, criticalWriteTimeout, true)
+	if scrcpySession != nil {
+		_ = scrcpySession.writeFull(buf, criticalWriteTimeout, true)
+	}
 }
 
 // ========= 伺服器入口 =========
@@ -504,47 +438,25 @@ func main() {
 		log.Fatal(srv.ListenAndServe())
 	})
 
-	// 連線到第一台 Android 裝置
+	// ?????? Android ??
 	deviceOpts := getADBOptions()
-	dev, conn, err := setupScrcpyDevice(deviceOpts)
-	if err != nil {
+	session := NewScrcpySession(deviceOpts)
+	if err := session.Start(); err != nil {
 		log.Fatal("[ADB] setup:", err)
 	}
-	scrcpyPort := dev.ScrcpyPort()
+	scrcpySession = session
+	defer scrcpySession.Close()
+
+	scrcpyPort := scrcpySession.ScrcpyPort()
 	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpyPort)
-	defer conn.VideoStream.Close()
-	defer conn.Control.Close()
-	controlConn = conn.Control
-	log.Println("[ADB] 已連上 scrcpy server")
+	conn := scrcpySession.Conn()
+	if conn == nil {
+		log.Fatal("[ADB] scrcpy connection not established")
+	}
+	scrcpySession.StartControlLoops()
+	log.Println("[ADB] ??? scrcpy server")
 
-	// 控制通道讀回解析：避免阻塞、可觀測是否有裝置回傳（像 clipboard）
-	goSafe("control-reader", func() {
-		readDeviceMessages(controlConn)
-	})
-
-	// 週期性 control 健康檢查（必要時送 GET_CLIPBOARD 當心跳）
-	goSafe("control-health", func() {
-		t := time.NewTicker(controlHealthTick)
-		defer t.Stop()
-		for range t.C {
-			if controlConn == nil {
-				continue
-			}
-			ms := time.Since(lastCtrlRead).Milliseconds()
-			if ms < 0 {
-				ms = 0
-			}
-			evLastCtrlReadMsAgo.Set(ms)
-
-			if time.Since(lastCtrlRead) > controlStaleAfter {
-				// 送一個 GET_CLIPBOARD 促使 server 回傳，確認雙向通暢
-				sendGetClipboard(0) // copyKey=COPY_KEY_NONE
-				evHeartbeatSent.Add(1)
-			}
-		}
-	})
-
-	// ★ 啟動 rtp-sender goroutine (解耦 I/O)
+	// ????????????????????? clipboard?
 	goSafe("rtp-sender", func() {
 		log.Println("[RTP] rtp-sender 啟動")
 		for payload := range frameChannel {
@@ -699,7 +611,9 @@ func main() {
 				waitKF = true // 更新本地副本
 				needKeyframe = true
 				stateMu.Unlock()
-				requestKeyframe()
+				if scrcpySession != nil {
+					scrcpySession.RequestKeyframe()
+				}
 				evKeyframeRequests.Add(1)
 			}
 
@@ -714,7 +628,9 @@ func main() {
 					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
 					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				} else {
-					requestKeyframe()
+					if scrcpySession != nil {
+						scrcpySession.RequestKeyframe()
+					}
 					evKeyframeRequests.Add(1)
 				}
 
@@ -722,7 +638,9 @@ func main() {
 				evFramesSinceKF.Set(int64(framesSinceKF))
 				if framesSinceKF%30 == 0 {
 					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
-					requestKeyframe()
+					if scrcpySession != nil {
+						scrcpySession.RequestKeyframe()
+					}
 					evKeyframeRequests.Add(1)
 				}
 
@@ -841,7 +759,9 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 					stateMu.Unlock()
 					evRTCP_PLI.Add(1)
 					evPLICount.Set(int64(pliCount))
-					requestKeyframe()
+					if scrcpySession != nil {
+						scrcpySession.RequestKeyframe()
+					}
 					evKeyframeRequests.Add(1)
 				case *rtcp.FullIntraRequest:
 					log.Printf("[RTCP] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", p.SenderSSRC, p.MediaSSRC)
@@ -852,7 +772,9 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 					stateMu.Unlock()
 					evRTCP_FIR.Add(1)
 					evPLICount.Set(int64(pliCount))
-					requestKeyframe()
+					if scrcpySession != nil {
+						scrcpySession.RequestKeyframe()
+					}
 					evKeyframeRequests.Add(1)
 				}
 			}
@@ -952,7 +874,9 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	stateMu.Unlock()
 
 	// 立刻請求關鍵幀
-	requestKeyframe()
+	if scrcpySession != nil {
+		scrcpySession.RequestKeyframe()
+	}
 	evKeyframeRequests.Add(1)
 
 	// 回傳 Answer（含 ICE）
@@ -962,105 +886,10 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 // 要求 Android 重新送出關鍵幀
 // ★ 修改：使用 writeFull 並設定 deadline
-func requestKeyframe() {
-	if controlConn == nil {
-		return
-	}
-	// ★ 使用 writeFull，它內部會鎖 controlMu。設定 50ms deadline。
-	if err := writeFull([]byte{controlMsgResetVideo}, controlWriteDefaultTimeout, true); err != nil {
-		// writeFull 內部已打印詳細錯誤
-		log.Println("[CTRL] send RESET_VIDEO 失敗")
-	} else {
-		log.Println("[CTRL] 已送出 RESET_VIDEO")
-	}
-}
-
 // 主動向 server 要求回傳剪貼簿（作為健康心跳）
 // ★ 修改：使用 writeFull 並設定 deadline
-func sendGetClipboard(copyKey byte) {
-	if controlConn == nil {
-		return
-	}
-	// ★ 使用 writeFull，它內部會鎖 controlMu。設定 50ms deadline。
-	if err := writeFull([]byte{controlMsgGetClipboard, copyKey}, controlWriteDefaultTimeout, true); err != nil {
-		log.Println("[CTRL] send GET_CLIPBOARD 失敗")
-	} else {
-		log.Println("[CTRL] 已送出 GET_CLIPBOARD (heartbeat)")
-	}
-}
-
 // === 控制通道讀回（DeviceMessage）===
 // 目前解析 TYPE_CLIPBOARD： [type(1)][len(4 BE)][utf8 bytes]
-func readDeviceMessages(r io.Reader) {
-	buf := make([]byte, 0, 4096)
-	readU8 := func() (byte, error) {
-		var b [1]byte
-		_, err := io.ReadFull(r, b[:])
-		return b[0], err
-	}
-	readU32BE := func() (uint32, error) {
-		var b [4]byte
-		_, err := io.ReadFull(r, b[:])
-		return binary.BigEndian.Uint32(b[:]), err
-	}
-
-	for {
-		typ, err := readU8()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			if err == io.EOF {
-				log.Println("[CTRL][READ] EOF")
-			} else {
-				log.Println("[CTRL][READ] error:", err)
-			}
-			evCtrlReadsErr.Add(1)
-			return
-		}
-
-		switch typ {
-		case deviceMsgTypeClipboard:
-			// len + data
-			n, err := readU32BE()
-			if err != nil {
-				log.Println("[CTRL][READ] clipboard len err:", err)
-				evCtrlReadsErr.Add(1)
-				return
-			}
-			if n > controlReadBufMax {
-				log.Printf("[CTRL][READ] clipboard 太大: %d > %d，截斷丟棄", n, controlReadBufMax)
-				// 丟棄 n bytes
-				if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
-					log.Println("[CTRL][READ] discard err:", err)
-					evCtrlReadsErr.Add(1)
-					return
-				}
-				continue
-			}
-			if cap(buf) < int(n) {
-				buf = make([]byte, n)
-			} else {
-				buf = buf[:n]
-			}
-			if _, err := io.ReadFull(r, buf[:n]); err != nil {
-				log.Println("[CTRL][READ] clipboard data err:", err)
-				evCtrlReadsErr.Add(1)
-				return
-			}
-			lastCtrlRead = time.Now()
-			evCtrlReadsOK.Add(1)
-			evCtrlReadClipboardB.Add(int64(n))
-			log.Printf("[CTRL][READ] DeviceMessage.CLIPBOARD %dB: %q", n, trimString(string(buf[:n]), 200))
-		default:
-			// 未知型別：無長度資訊 → 無法安全跳過，只記錄
-			lastCtrlRead = time.Now()
-			evCtrlReadsOK.Add(1)
-			log.Printf("[CTRL][READ] 未知 DeviceMessage type=%d（未解析，可能為未來版本）", typ)
-		}
-	}
-}
-
 func trimString(s string, max int) string {
 	if len(s) <= max {
 		return s
