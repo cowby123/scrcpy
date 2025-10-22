@@ -32,6 +32,8 @@ import (
 	"github.com/yourname/scrcpy-go/adb"
 )
 
+// registerADBFlags 註冊 ADB 相關的命令行參數並返回配置選項獲取函數
+// 用途：配置 ADB 連接參數，包括設備序號、伺服器主機、端口等
 func registerADBFlags(fs *flag.FlagSet) func() adb.Options {
 	serial := fs.String("adb-serial", "", "adb device serial (e.g. ip:port)")
 	host := fs.String("adb-host", "", "adb server host (optional)")
@@ -144,6 +146,8 @@ var (
 )
 
 // ====== ★ 解耦 Video 讀/寫 ======
+// RtpPayload RTP 載荷結構體
+// 用途：封裝要透過 RTP 傳輸的視訊資料，包含 NALU 單元、時間戳和存取單元標記
 type RtpPayload struct {
 	NALUs        [][]byte
 	RTPTimestamp uint32
@@ -154,6 +158,8 @@ type RtpPayload struct {
 var frameChannel = make(chan RtpPayload, rtpPayloadChannelSize)
 
 // ★ 推送至 RTP channel，若壅塞則丟棄
+// pushToRTPChannel 將 RTP 載荷推送到處理通道
+// 用途：非阻塞式推送視訊幀到 RTP 通道，當通道滿時主動丟幀以降低延遲
 func pushToRTPChannel(payload RtpPayload) {
 	select {
 	case frameChannel <- payload:
@@ -167,6 +173,8 @@ func pushToRTPChannel(payload RtpPayload) {
 }
 
 // ★ 清空 RTP channel (WebRTC 斷線時)
+// clearFrameChannel 清空 RTP 幀處理通道
+// 用途：當 WebRTC 連接斷開時清空通道中的所有待處理幀，防止記憶體累積
 func clearFrameChannel() {
 	for {
 		select {
@@ -180,6 +188,8 @@ func clearFrameChannel() {
 }
 
 // ====== 工具：安全啟動 goroutine，避免 panic 默默死掉 ======
+// goSafe 安全啟動 goroutine，捕獲 panic 並記錄錯誤
+// 用途：防止 goroutine 中的 panic 導致整個程式崩潰，提供錯誤追蹤和日誌記錄
 func goSafe(name string, fn func()) {
 	go func() {
 		defer func() {
@@ -203,12 +213,17 @@ var touchLocalByRemote = map[uint64]uint16{}
 var touchRemoteByLocal [maxPointers]uint64
 var touchSlotUsed [maxPointers]bool
 
+// getLocalSlot 根據遠端觸控點 ID 獲取本地槽位編號
+// 用途：查找已分配給特定遠端觸控點的本地槽位，用於多點觸控映射
 func getLocalSlot(remote uint64) (uint16, bool) {
 	if s, ok := touchLocalByRemote[remote]; ok {
 		return s, true
 	}
 	return 0, false
 }
+
+// allocLocalSlot 為遠端觸控點 ID 分配本地槽位編號
+// 用途：為新的觸控點分配可用的本地槽位，支持最多 10 個同時觸控點
 func allocLocalSlot(remote uint64) (uint16, bool) {
 	if s, ok := touchLocalByRemote[remote]; ok {
 		return s, true
@@ -223,6 +238,9 @@ func allocLocalSlot(remote uint64) (uint16, bool) {
 	}
 	return 0, false
 }
+
+// freeLocalSlot 釋放遠端觸控點 ID 對應的本地槽位
+// 用途：當觸控點結束（up/cancel）時釋放占用的槽位，供後續觸控點使用
 func freeLocalSlot(remote uint64) {
 	if s, ok := touchLocalByRemote[remote]; ok {
 		delete(touchLocalByRemote, remote)
@@ -235,6 +253,8 @@ func freeLocalSlot(remote uint64) {
 // 寫入控制 socket：**一定寫完整個封包**，並可選設置 write deadline（避免長時間阻塞）
 // ★ 修改：回傳 error
 // ====== 前端事件（JSON）→ 官方線路格式（32 bytes）======
+// touchEvent 觸控事件結構體
+// 用途：定義從前端 WebRTC DataChannel 接收的觸控事件資料格式，包含座標、壓力、按鍵狀態等
 type touchEvent struct {
 	Type        string  `json:"type"` // "down" | "up" | "move" | "cancel"
 	ID          uint64  `json:"id"`   // pointer id（前端的）
@@ -247,6 +267,8 @@ type touchEvent struct {
 	PointerType string  `json:"pointerType"` // "mouse" | "touch" | "pen"
 }
 
+// handleTouchEvent 處理前端發送的觸控事件
+// 用途：將 WebRTC DataChannel 收到的觸控事件轉換為 scrcpy 控制指令並發送給 Android 設備
 func handleTouchEvent(ev touchEvent) {
 	defer func() {
 		pointerMu.Lock()
@@ -409,21 +431,33 @@ func handleTouchEvent(ev touchEvent) {
 
 // ========= 伺服器入口 =========
 
+// main 程式主入口函數
+// 用途：初始化 HTTP 伺服器、建立 ADB 連接、處理視訊串流和 WebRTC 連接
 func main() {
+	// === 1. 解析命令行參數 ===
+	// 註冊 ADB 相關的命令行標誌並獲取配置函數
 	getADBOptions := registerADBFlags(flag.CommandLine)
+	// 解析所有命令行參數
 	flag.Parse()
 
-	// 進階 log 格式（含毫秒與檔名:行號）
+	// === 2. 配置日誌格式 ===
+	// 設定進階 log 格式（含毫秒與檔名:行號），方便除錯
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
-	// 基礎 HTTP/除錯
+
+	// === 3. 設定 HTTP 路由處理器 ===
+	// 根路由：提供靜態檔案服務，主要用於前端頁面
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
+			// 直接提供 index.html 作為主頁
 			http.ServeFile(w, r, "index.html")
 			return
 		}
+		// 其他路徑使用檔案伺服器提供靜態資源
 		http.FileServer(http.Dir(".")).ServeHTTP(w, r)
 	})
+	// WebRTC SDP 交換端點
 	http.HandleFunc("/offer", handleOffer)
+	// 除錯用的堆疊追蹤端點
 	http.HandleFunc("/debug/stack", func(w http.ResponseWriter, r *http.Request) {
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
@@ -431,6 +465,8 @@ func main() {
 		_, _ = w.Write(buf[:n])
 	})
 
+	// === 4. 啟動 HTTP 伺服器 ===
+	// 使用安全的 goroutine 啟動 HTTP 伺服器（防止 panic 導致程式崩潰）
 	goSafe("http-server", func() {
 		addr := ":8080"
 		log.Println("[HTTP] 服務啟動:", addr, "（/ , /offer , /debug/pprof , /debug/vars , /debug/stack）")
@@ -438,122 +474,149 @@ func main() {
 		log.Fatal(srv.ListenAndServe())
 	})
 
-	// ?????? Android ??
+	// === 5. 建立與 Android 設備的連接 ===
+	// 取得 ADB 配置選項
 	deviceOpts := getADBOptions()
+	// 建立新的 scrcpy 會話
 	session := NewScrcpySession(deviceOpts)
+	// 啟動 scrcpy 連接（包含 ADB 設定、端口轉發、啟動 scrcpy server 等）
 	if err := session.Start(); err != nil {
 		log.Fatal("[ADB] setup:", err)
 	}
+	// 設定全域會話並確保程式結束時正確關閉
 	scrcpySession = session
 	defer scrcpySession.Close()
 
+	// 取得連接資訊並驗證連接狀態
 	scrcpyPort := scrcpySession.ScrcpyPort()
 	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpyPort)
 	conn := scrcpySession.Conn()
 	if conn == nil {
 		log.Fatal("[ADB] scrcpy connection not established")
 	}
+	// 啟動控制迴圈（處理控制指令發送和設備訊息接收）
 	scrcpySession.StartControlLoops()
-	log.Println("[ADB] ??? scrcpy server")
+	log.Println("[ADB] scrcpy server 連接成功")
 
-	// ????????????????????? clipboard?
+	// === 6. 啟動 RTP 發送器 ===
+	// 啟動專門的 goroutine 處理 RTP 封包發送，與視訊讀取解耦合
 	goSafe("rtp-sender", func() {
 		log.Println("[RTP] rtp-sender 啟動")
+		// 持續從通道中取出 RTP 載荷並發送
 		for payload := range frameChannel {
 			if payload.IsAccessUnit {
-				// 傳送一個完整的 AU (Marker bit 會在最後一個 NALU 的最後一個 packet 上)
+				// 傳送一個完整的存取單元 (AU)，Marker bit 會在最後一個 NALU 的最後一個 packet 上
 				sendNALUAccessUnitAtTS(payload.NALUs, payload.RTPTimestamp)
 			} else {
-				// 傳送單獨的 NALU (例如 SPS/PPS，不設定 Marker bit)
+				// 傳送單獨的 NALU (例如 SPS/PPS 參數集)，不設定 Marker bit
 				sendNALUsAtTS(payload.RTPTimestamp, payload.NALUs...)
 			}
 		}
 		log.Println("[RTP] rtp-sender 停止")
 	})
 
+	// === 7. 初始化視訊串流接收 ===
 	log.Println("[VIDEO] 開始接收視訊串流")
 
-	// 跳過裝置名稱 (64 bytes, NUL 結尾)
+	// 讀取設備名稱（固定 64 位元組，以 NUL 結尾）
 	nameBuf := make([]byte, 64)
 	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
 		log.Fatal("[VIDEO] read device name:", err)
 	}
+	// 移除尾部的 NUL 字元並取得設備名稱
 	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
 	log.Printf("[VIDEO] 裝置名稱: %s", deviceName)
 
-	// 視訊標頭 (12 bytes)：[codecID(u32)][w(u32)][h(u32)]
+	// 讀取視訊標頭資訊（12 位元組）：[codecID(u32)][width(u32)][height(u32)]
 	vHeader := make([]byte, 12)
 	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
 		log.Fatal("[VIDEO] read video header:", err)
 	}
+	// 解析編碼器 ID 和初始解析度
 	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（依版本可能不同）
-	w0 := binary.BigEndian.Uint32(vHeader[4:8])
-	h0 := binary.BigEndian.Uint32(vHeader[8:12])
+	w0 := binary.BigEndian.Uint32(vHeader[4:8])      // 視訊寬度
+	h0 := binary.BigEndian.Uint32(vHeader[8:12])     // 視訊高度
 
+	// 更新全域視訊解析度狀態（作為觸控映射的後備值）
 	stateMu.Lock()
-	videoW, videoH = uint16(w0), uint16(h0) // 後備觸控映射空間
+	videoW, videoH = uint16(w0), uint16(h0)
 	stateMu.Unlock()
+	// 更新監控指標
 	evVideoW.Set(int64(videoW))
 	evVideoH.Set(int64(videoH))
 
 	log.Printf("[VIDEO] 編碼ID: %d, 初始解析度: %dx%d", codecID, w0, h0)
 
-	// 接收幀迴圈（多數版本：meta 12 bytes：[PTS(u64)] + [size(u32)]）
-	meta := make([]byte, 12)
-	startTime = time.Now()
-	var frameCount int
-	var totalBytes int64
+	// === 8. 主要的視訊幀接收與處理迴圈 ===
+	// 初始化幀處理所需的變數
+	meta := make([]byte, 12) // 幀元資料緩衝區（PTS + 幀大小）
+	startTime = time.Now()   // 記錄開始時間用於計算處理速率
+	var frameCount int       // 已處理的幀數量計數器
+	var totalBytes int64     // 累計處理的位元組數
 
+	// 無限迴圈處理每一個視訊幀
 	for {
-		// frame meta
+		// === 8.1 讀取幀元資料 ===
+		// 測量讀取幀元資料的耗時
 		t0 := time.Now()
 		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
 			log.Println("[VIDEO] read frame meta:", err)
-			break
+			break // 讀取失敗時退出迴圈
 		}
 		metaElapsed := time.Since(t0)
 		evLastFrameMetaMS.Set(metaElapsed.Milliseconds())
+		// 如果讀取時間過長則發出警告
 		if metaElapsed > warnFrameMetaOver {
 			log.Printf("[VIDEO] 讀 meta 偏慢: %v", metaElapsed)
 		}
 
-		pts := binary.BigEndian.Uint64(meta[0:8])
-		frameSize := binary.BigEndian.Uint32(meta[8:12])
+		// 解析幀元資料：[PTS(u64)] + [frameSize(u32)]
+		pts := binary.BigEndian.Uint64(meta[0:8])        // 呈現時間戳（微秒）
+		frameSize := binary.BigEndian.Uint32(meta[8:12]) // 幀資料大小
 
-		// 初始化 PTS 基準
+		// === 8.2 初始化時間戳基準 ===
+		// 第一幀時建立 PTS 到 RTP 時間戳的對應關係
 		if !havePTS0 {
-			pts0 = pts
-			rtpTS0 = 0
+			pts0 = pts // 記錄第一幀的 PTS 作為基準
+			rtpTS0 = 0 // RTP 時間戳從 0 開始
 			havePTS0 = true
 		}
+		// 計算當前幀對應的 RTP 時間戳
 		curTS := rtpTS0 + rtpTSFromPTS(pts, pts0)
 
-		// frame data
+		// === 8.3 讀取幀資料 ===
+		// 測量讀取幀資料的耗時
 		t1 := time.Now()
-		frame := make([]byte, frameSize)
+		frame := make([]byte, frameSize) // 分配幀資料緩衝區
 		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
 			log.Println("[VIDEO] read frame:", err)
-			break
+			break // 讀取失敗時退出迴圈
 		}
 		readElapsed := time.Since(t1)
 		evLastFrameReadMS.Set(readElapsed.Milliseconds())
+		// 如果讀取時間過長則發出警告
 		if readElapsed > warnFrameReadOver {
 			log.Printf("[VIDEO] 讀 frame 偏慢: %v (size=%d)", readElapsed, frameSize)
 		}
 
-		// 解析 Annex-B → NALUs，並快取 SPS/PPS、偵測是否含 IDR
+		// === 8.4 解析 H.264 位元流並分析 NALU 類型 ===
+		// 將 Annex-B 格式的位元流分割為獨立的 NALU 單元
 		nalus := splitAnnexBNALUs(frame)
 
-		idrInThisAU := false
-		var gotNewSPS bool
-		var spsCnt, ppsCnt, idrCnt, othersCnt int
+		// 初始化 NALU 分析變數
+		idrInThisAU := false                      // 標記此存取單元是否包含 IDR 幀
+		var gotNewSPS bool                        // 標記是否收到新的 SPS
+		var spsCnt, ppsCnt, idrCnt, othersCnt int // 各類型 NALU 的計數器
 
+		// 遍歷所有 NALU 並分析類型
 		for _, n := range nalus {
 			switch naluType(n) {
-			case 7: // SPS
+			case 7: // SPS (Sequence Parameter Set - 序列參數集)
 				spsCnt++
 				stateMu.Lock()
+				// 檢查是否為新的 SPS（與上次快取的不同）
 				if !bytes.Equal(lastSPS, n) {
+					// 嘗試從新 SPS 中解析視訊解析度
 					if w, h, ok := parseH264SPSDimensions(n); ok {
 						videoW, videoH = w, h
 						gotNewSPS = true
@@ -562,44 +625,53 @@ func main() {
 						log.Printf("[AU] 更新 SPS 並套用解析度 %dx%d 給觸控映射(後備)", w, h)
 					}
 				}
+				// 快取最新的 SPS
 				lastSPS = append([]byte(nil), n...)
 				stateMu.Unlock()
-			case 8: // PPS
+			case 8: // PPS (Picture Parameter Set - 圖像參數集)
 				ppsCnt++
 				stateMu.Lock()
+				// 檢查是否為新的 PPS
 				if !bytes.Equal(lastPPS, n) {
 					log.Printf("[AU] 更新 PPS (len=%d)", len(n))
 				}
+				// 快取最新的 PPS
 				lastPPS = append([]byte(nil), n...)
 				stateMu.Unlock()
-			case 5: // IDR
+			case 5: // IDR (Instantaneous Decoder Refresh - 即時解碼器重整幀)
 				idrCnt++
-				idrInThisAU = true
-			default:
+				idrInThisAU = true // 標記此存取單元包含關鍵幀
+			default: // 其他類型的 NALU（P 幀、B 幀等）
 				othersCnt++
 			}
 		}
+		// 更新各類型 NALU 的統計計數器
 		evNALU_SPS.Add(int64(spsCnt))
 		evNALU_PPS.Add(int64(ppsCnt))
 		evNALU_IDR.Add(int64(idrCnt))
 		evNALU_Others.Add(int64(othersCnt))
 
-		// 狀態
+		// === 8.5 檢查 WebRTC 連接狀態 ===
+		// 取得當前 WebRTC 相關物件的狀態（使用讀鎖避免阻塞）
 		stateMu.RLock()
-		vt := videoTrack
-		pk := packetizer
-		waitKF := needKeyframe
+		vt := videoTrack       // WebRTC 視訊軌道
+		pk := packetizer       // RTP 封包化器
+		waitKF := needKeyframe // 是否正在等待關鍵幀
 		stateMu.RUnlock()
 
-		// 推進 WebRTC (★ 改為推送 Channel)
+		// === 8.6 處理視訊資料並推送到 WebRTC ===
+		// 只有在 WebRTC 連接建立且 RTP 元件準備就緒時才處理
 		if vt != nil && pk != nil {
-			// 若剛換解析度，先送 SPS/PPS，並請 IDR
+			// === 8.6.1 處理 SPS 變更 ===
+			// 當收到新的 SPS（解析度可能改變）時的處理邏輯
 			if gotNewSPS {
+				// 取得最新的 SPS/PPS 參數集
 				stateMu.RLock()
 				sps := lastSPS
 				pps := lastPPS
 				stateMu.RUnlock()
-				// ★ 推送 SPS/PPS 到 channel
+
+				// 先推送新的參數集到 RTP 通道
 				if len(sps) > 0 {
 					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				}
@@ -607,35 +679,45 @@ func main() {
 					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				}
 
+				// 設定需要等待關鍵幀標誌並請求 IDR 幀
 				stateMu.Lock()
-				waitKF = true // 更新本地副本
-				needKeyframe = true
+				waitKF = true       // 更新本地副本
+				needKeyframe = true // 設定全域狀態
 				stateMu.Unlock()
+
+				// 向 Android 設備請求關鍵幀
 				if scrcpySession != nil {
 					scrcpySession.RequestKeyframe()
 				}
-				evKeyframeRequests.Add(1)
+				evKeyframeRequests.Add(1) // 更新請求計數器
 			}
 
+			// === 8.6.2 處理關鍵幀等待邏輯 ===
 			if waitKF {
+				// 取得當前的參數集
 				stateMu.RLock()
 				sps := lastSPS
 				pps := lastPPS
 				stateMu.RUnlock()
 
+				// 確保參數集已準備就緒，否則再次請求關鍵幀
 				if len(sps) > 0 && len(pps) > 0 {
-					// ★ 推送 SPS+PPS 到 channel (分開推)
+					// 推送參數集到 RTP 通道（分開推送以確保順序）
 					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
 					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				} else {
+					// 參數集尚未準備好，請求關鍵幀
 					if scrcpySession != nil {
 						scrcpySession.RequestKeyframe()
 					}
 					evKeyframeRequests.Add(1)
 				}
 
+				// 追蹤等待關鍵幀的幀數
 				framesSinceKF++
 				evFramesSinceKF.Set(int64(framesSinceKF))
+
+				// 每 30 幀重新請求一次關鍵幀（避免請求遺失）
 				if framesSinceKF%30 == 0 {
 					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
 					if scrcpySession != nil {
@@ -644,52 +726,65 @@ func main() {
 					evKeyframeRequests.Add(1)
 				}
 
+				// 如果當前幀不包含 IDR，跳過處理（不推送到 WebRTC）
 				if !idrInThisAU {
-					goto stats // ★ 丟棄非 IDR 幀 (不推送)
+					goto stats // 跳到統計更新，丟棄非 IDR 幀
 				}
 
+				// 收到 IDR 幀，可以開始正常串流
 				log.Println("[KF] 偵測到 IDR，開始送流")
 				stateMu.Lock()
-				needKeyframe = false
-				framesSinceKF = 0
+				needKeyframe = false // 清除等待關鍵幀標誌
+				framesSinceKF = 0    // 重置計數器
 				stateMu.Unlock()
 				evFramesSinceKF.Set(0)
 
-				// ★ 推送 IDR (AU) 到 Channel
+				// 推送包含 IDR 的存取單元到 RTP 通道
 				pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
 			} else {
-				// ★ 推送 P 幀 (AU) 到 Channel
+				// === 8.6.3 正常串流模式 ===
+				// 不需要等待關鍵幀，直接推送 P 幀或其他幀類型
 				pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
 			}
 		}
 
+		// === 8.7 更新統計資訊 ===
 	stats:
+		// 累計處理的幀數和位元組數
 		frameCount++
 		totalBytes += int64(frameSize)
-		evFramesRead.Add(1)
-		evBytesRead.Add(int64(frameSize))
+		evFramesRead.Add(1)               // 更新已讀取幀數指標
+		evBytesRead.Add(int64(frameSize)) // 更新已讀取位元組數指標
 
+		// 每隔指定數量的幀輸出統計資訊
 		if frameCount%statsLogEvery == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			bytesPerSecond := float64(totalBytes) / elapsed
+
+			// 取得當前狀態用於統計輸出
 			stateMu.RLock()
-			lp := lastPLI
-			pc := pliCount
-			dropped := evFramesDropped.Value()
+			lp := lastPLI                      // 最後一次 PLI 時間
+			pc := pliCount                     // PLI 累計次數
+			dropped := evFramesDropped.Value() // 丟幀數量
 			stateMu.RUnlock()
+
+			// 輸出詳細的處理統計資訊
 			log.Printf("[STATS] 影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s), AUseq=%d, 丟幀(w): %d",
 				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339), auSeq, dropped)
 		}
 
-		// 下一 AU 序號
+		// === 8.8 更新存取單元序號 ===
+		// 每處理完一個幀就遞增 AU 序號（用於追蹤和除錯）
 		stateMu.Lock()
 		auSeq++
 		stateMu.Unlock()
 		evAuSeq.Set(int64(auSeq))
-	}
+	} // 視訊幀處理迴圈結束
 }
 
 // === WebRTC: /offer handler ===
+// handleOffer 處理 WebRTC 的 SDP offer 請求
+// 用途：建立 WebRTC 連接，配置視訊軌道和數據通道，處理 RTCP 反饋和觸控事件
 func handleOffer(w http.ResponseWriter, r *http.Request) {
 	var offer webrtc.SessionDescription
 	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
@@ -890,6 +985,8 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 // ★ 修改：使用 writeFull 並設定 deadline
 // === 控制通道讀回（DeviceMessage）===
 // 目前解析 TYPE_CLIPBOARD： [type(1)][len(4 BE)][utf8 bytes]
+// trimString 截斷字串到指定長度並添加省略號
+// 用途：限制日誌輸出中字串的長度，防止過長的文字影響日誌可讀性
 func trimString(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -899,6 +996,8 @@ func trimString(s string, max int) string {
 
 // === RTP 發送（以指定 TS）===
 // ★ 注意：這些函式現在由 'rtp-sender' goroutine 唯一呼叫
+// sendNALUAccessUnitAtTS 以指定時間戳發送完整的 NALU 存取單元
+// 用途：將 H.264 存取單元（AU）打包成 RTP 封包並透過 WebRTC 發送，在最後一個封包設置 Marker bit
 func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 	stateMu.RLock()
 	pk := packetizer
@@ -921,6 +1020,9 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 		}
 	}
 }
+
+// sendNALUsAtTS 以指定時間戳發送單獨的 NALU 單元
+// 用途：發送獨立的 NALU（如 SPS/PPS 參數集），不設置 Marker bit，用於參數集傳輸
 func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 	stateMu.RLock()
 	pk := packetizer
@@ -945,6 +1047,8 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 }
 
 // === Annex-B 工具 ===
+// splitAnnexBNALUs 將 Annex-B 格式的位元流分割為獨立的 NALU 單元
+// 用途：解析 H.264 Annex-B 格式的視訊流，提取各個 NALU 單元供後續處理
 func splitAnnexBNALUs(b []byte) [][]byte {
 	var nalus [][]byte
 	i := 0
@@ -969,6 +1073,9 @@ func splitAnnexBNALUs(b []byte) [][]byte {
 	}
 	return nalus
 }
+
+// findStartCode 在位元組陣列中尋找 H.264 起始碼
+// 用途：查找 Annex-B 格式中的 NALU 起始碼（00 00 01 或 00 00 00 01）
 func findStartCode(b []byte, from int) (int, int) {
 	for i := from; i+3 <= len(b); i++ {
 		// 00 00 01
@@ -982,6 +1089,9 @@ func findStartCode(b []byte, from int) (int, int) {
 	}
 	return -1, -1
 }
+
+// naluType 取得 NALU 的類型
+// 用途：從 NALU 標頭的低 5 位元提取 NALU 類型（SPS=7, PPS=8, IDR=5 等）
 func naluType(n []byte) uint8 {
 	if len(n) == 0 {
 		return 0
@@ -990,17 +1100,23 @@ func naluType(n []byte) uint8 {
 }
 
 // === PTS → RTP TS 轉換 ===
+// rtpTSFromPTS 將 PTS（呈現時間戳）轉換為 RTP 時間戳
+// 用途：將 scrcpy 的微秒 PTS 轉換為 RTP 標準的 90kHz 時間戳格式
 func rtpTSFromPTS(pts, base uint64) uint32 {
 	delta := pts - base
 	return uint32((delta * 90000) / ptsPerSecond) // 90kHz * 秒數
 }
 
 // === H.264 SPS 解析寬高（極簡）===
+// bitReader 位元流讀取器結構體
+// 用途：用於逐位讀取 H.264 RBSP 資料，支援解析 SPS 中的各種編碼欄位
 type bitReader struct {
 	b []byte
 	i int // bit index
 }
 
+// parseH264SPSDimensions 解析 H.264 SPS 中的視訊尺寸資訊
+// 用途：從 SPS（序列參數集）中提取視訊的寬度和高度，用於觸控座標映射
 func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 	if len(nal) < 4 || (nal[0]&0x1F) != 7 {
 		return
@@ -1202,6 +1318,8 @@ func parseH264SPSDimensions(nal []byte) (w, h uint16, ok bool) {
 }
 
 // --- bitReader ---
+// u 從位元流中讀取指定位數的無符號整數
+// 用途：從 H.264 RBSP 位元流中按位讀取數據，用於解析 SPS 參數
 func (br *bitReader) u(n int) (uint, bool) {
 	if n <= 0 {
 		return 0, true
@@ -1219,7 +1337,13 @@ func (br *bitReader) u(n int) (uint, bool) {
 	}
 	return v, true
 }
+
+// skip 跳過位元流中指定位數的資料
+// 用途：在解析 SPS 時跳過不需要的欄位，簡化位元流解析邏輯
 func (br *bitReader) skip(n int) bool { _, ok := br.u(n); return ok }
+
+// ue 讀取 Exp-Golomb 無符號編碼值
+// 用途：解析 H.264 標準中的 ue(v) 指數哥倫布編碼，用於讀取 SPS 中的各種參數
 func (br *bitReader) ue() (uint, bool) {
 	var leadingZeros int
 	for {
@@ -1242,6 +1366,9 @@ func (br *bitReader) ue() (uint, bool) {
 	}
 	return (1 << leadingZeros) - 1 + val, true
 }
+
+// se 讀取 Exp-Golomb 有符號編碼值
+// 用途：解析 H.264 標準中的 se(v) 指數哥倫布有符號編碼，用於讀取可能為負數的 SPS 參數
 func (br *bitReader) se() (int, bool) {
 	uev, ok := br.ue()
 	if !ok {
