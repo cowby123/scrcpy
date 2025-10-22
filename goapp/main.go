@@ -49,6 +49,267 @@ func registerADBFlags(fs *flag.FlagSet) func() adb.Options {
 	}
 }
 
+func runAndroidStreaming(deviceOpts adb.Options) {
+	session, conn, err := StartScrcpyBoot(deviceOpts)
+	if err != nil {
+		log.Fatal("[ADB] setup:", err)
+	}
+	scrcpySession = session
+	defer scrcpySession.Close()
+	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpySession.ScrcpyPort())
+	log.Println("[ADB] scrcpy server 已啟動")
+
+	// === 6. 啟動 RTP 發送器 ===
+	// 啟動專門的 goroutine 處理 RTP 封包發送，與視訊讀取解耦合
+	goSafe("rtp-sender", func() {
+		log.Println("[RTP] rtp-sender 啟動")
+		// 不斷從通道取得 RTP 負載並發送
+		for payload := range frameChannel {
+			if payload.IsAccessUnit {
+				// 發送整個存取單元 (AU)，Marker bit 會在最後一個 NALU 與最後一個 packet 上
+				sendNALUAccessUnitAtTS(payload.NALUs, payload.RTPTimestamp)
+			} else {
+				// 發送單獨的 NALU (例如 SPS/PPS 參數)，不設定 Marker bit
+				sendNALUsAtTS(payload.RTPTimestamp, payload.NALUs...)
+			}
+		}
+		log.Println("[RTP] rtp-sender 結束")
+	})
+
+	// === 7. 開始視訊串流讀取 ===
+	log.Println("[VIDEO] 開始接收視訊串流")
+
+	// 讀取設備名稱（固定 64 位元組，以 NUL 結尾）
+	nameBuf := make([]byte, 64)
+	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
+		log.Fatal("[VIDEO] read device name:", err)
+	}
+	// 去除尾端的 NUL 字元並取得設備名稱
+	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
+	log.Printf("[VIDEO] 裝置名稱: %s", deviceName)
+
+	// 讀取視訊格式資訊（12 位元組）：[codecID(u32)][width(u32)][height(u32)]
+	vHeader := make([]byte, 12)
+	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
+		log.Fatal("[VIDEO] read video header:", err)
+	}
+	// 解析編碼 ID 與初始解析度
+	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（此版本主要支援 H264）
+	w0 := binary.BigEndian.Uint32(vHeader[4:8])      // 視訊寬度
+	h0 := binary.BigEndian.Uint32(vHeader[8:12])     // 視訊高度
+
+	// 更新當前視訊解析度，用於觸控事件的座標換算
+	stateMu.Lock()
+	videoW, videoH = uint16(w0), uint16(h0)
+	stateMu.Unlock()
+	// 更新觀測指標
+	evVideoW.Set(int64(videoW))
+	evVideoH.Set(int64(videoH))
+
+	log.Printf("[VIDEO] 編碼ID: %d, 初始解析度: %dx%d", codecID, w0, h0)
+
+	// === 8. 主要視訊資料讀取與處理迴圈 ===
+	// 初始化讀取與處理所需的變數
+	meta := make([]byte, 12) // 幀資訊緩衝（PTS + 幀大小）
+	startTime = time.Now()   // 紀錄開始時間，用於計算處理速率
+	var frameCount int       // 已處理幀數統計
+	var totalBytes int64     // 累積處理大小
+
+	// 連續迴圈處理每一幀視訊
+	for {
+		// === 8.1 讀取幀資訊 ===
+		// 測量讀取幀資訊耗時
+		t0 := time.Now()
+		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
+			log.Println("[VIDEO] read frame meta:", err)
+			break // 讀取失敗時結束迴圈
+		}
+		metaElapsed := time.Since(t0)
+		evLastFrameMetaMS.Set(metaElapsed.Milliseconds())
+		// 若讀取時間過長，輸出警告
+		if metaElapsed > warnFrameMetaOver {
+			log.Printf("[VIDEO] 讀 meta 偏慢: %v", metaElapsed)
+		}
+
+		// 解析幀資訊：[PTS(u64)] + [frameSize(u32)]
+		pts := binary.BigEndian.Uint64(meta[0:8])        // 呈現時間戳（微秒）
+		frameSize := binary.BigEndian.Uint32(meta[8:12]) // 幀大小
+
+		// === 8.2 初始化時間對齊 ===
+		// 第一幀時建立 PTS 與 RTP 時間戳的對應關係
+		if !havePTS0 {
+			pts0 = pts // 記下第一幀的 PTS 作為基準
+			rtpTS0 = 0 // RTP 時間戳從 0 開始
+			havePTS0 = true
+		}
+		// 計算當前幀的 RTP 時間戳
+		curTS := rtpTS0 + rtpTSFromPTS(pts, pts0)
+
+		// === 8.3 讀取幀資料 ===
+		// 測量讀取幀資料耗時
+		t1 := time.Now()
+		frame := make([]byte, frameSize) // 配置幀資料緩衝
+		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
+			log.Println("[VIDEO] read frame:", err)
+			break
+		}
+		readElapsed := time.Since(t1)
+		evLastFrameReadMS.Set(readElapsed.Milliseconds())
+		if readElapsed > warnFrameReadOver {
+			log.Printf("[VIDEO] 讀 frame 偏慢: %v (size=%d)", readElapsed, frameSize)
+		}
+
+		// === 8.4 解析 NALUs ===
+		// 解析 Annex-B 格式的 NALU，並檢測是否包含 IDR
+		nalus := splitAnnexBNALUs(frame)
+
+		idrInThisAU := false
+		var gotNewSPS bool
+		var spsCnt, ppsCnt, idrCnt, othersCnt int
+
+		for _, n := range nalus {
+			switch naluType(n) {
+			case 7: // SPS
+				spsCnt++
+				stateMu.Lock()
+				if !bytes.Equal(lastSPS, n) {
+					if w, h, ok := parseH264SPSDimensions(n); ok {
+						videoW, videoH = w, h
+						gotNewSPS = true
+						evVideoW.Set(int64(videoW))
+						evVideoH.Set(int64(videoH))
+						log.Printf("[AU] 新的 SPS 並成功解析解析度 %dx%d", w, h)
+					}
+				}
+				lastSPS = append([]byte(nil), n...)
+				stateMu.Unlock()
+			case 8: // PPS
+				ppsCnt++
+				stateMu.Lock()
+				if !bytes.Equal(lastPPS, n) {
+					log.Printf("[AU] 新的 PPS (len=%d)", len(n))
+				}
+				lastPPS = append([]byte(nil), n...)
+				stateMu.Unlock()
+			case 5: // IDR
+				idrCnt++
+				idrInThisAU = true
+			default:
+				othersCnt++
+			}
+		}
+		evNALU_SPS.Add(int64(spsCnt))
+		evNALU_PPS.Add(int64(ppsCnt))
+		evNALU_IDR.Add(int64(idrCnt))
+		evNALU_Others.Add(int64(othersCnt))
+
+		// === 8.5 檢查並處理關鍵幀等待狀態 ===
+		stateMu.RLock()
+		waitKF := needKeyframe // 使用全域狀態，而不是每次重設
+		stateMu.RUnlock()
+
+		// === 8.6 處理 SPS 變更情況 ===
+		if gotNewSPS {
+			// 推送最新的 SPS/PPS 參數
+			stateMu.RLock()
+			sps := lastSPS
+			pps := lastPPS
+			stateMu.RUnlock()
+
+			if len(sps) > 0 {
+				pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
+			}
+			if len(pps) > 0 {
+				pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
+			}
+
+			// 設定等待關鍵幀狀態
+			stateMu.Lock()
+			needKeyframe = true
+			waitKF = true // 更新本地副本
+			stateMu.Unlock()
+
+			// 請求關鍵幀（只在 SPS 變更時請求一次）
+			if scrcpySession != nil {
+				scrcpySession.RequestKeyframe()
+			}
+			evKeyframeRequests.Add(1)
+			log.Println("[KF] 檢測到新 SPS，已請求關鍵幀")
+		}
+
+		// === 8.7 處理關鍵幀等待邏輯 ===
+		if waitKF {
+			stateMu.RLock()
+			sps := lastSPS
+			pps := lastPPS
+			stateMu.RUnlock()
+
+			if len(sps) > 0 && len(pps) > 0 {
+				pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
+				pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
+			} else {
+				if scrcpySession != nil {
+					scrcpySession.RequestKeyframe()
+				}
+				evKeyframeRequests.Add(1)
+			}
+
+			framesSinceKF++
+			evFramesSinceKF.Set(int64(framesSinceKF))
+
+			if framesSinceKF%30 == 0 {
+				log.Printf("[KF] 等待 IDR 中... 已經 %d 幀；再次請求 IDR", framesSinceKF)
+				if scrcpySession != nil {
+					scrcpySession.RequestKeyframe()
+				}
+				evKeyframeRequests.Add(1)
+			}
+
+			if !idrInThisAU {
+				goto stats
+			}
+
+			log.Println("[KF] 收到 IDR，恢復正常串流")
+			stateMu.Lock()
+			needKeyframe = false
+			framesSinceKF = 0
+			stateMu.Unlock()
+			evFramesSinceKF.Set(0)
+
+			pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
+		} else {
+			pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
+		}
+
+		// === 8.7 更新統計 ===
+	stats:
+		frameCount++
+		totalBytes += int64(frameSize)
+		evFramesRead.Add(1)
+		evBytesRead.Add(int64(frameSize))
+
+		if frameCount%statsLogEvery == 0 {
+			elapsed := time.Since(startTime).Seconds()
+			bytesPerSecond := float64(totalBytes) / elapsed
+
+			stateMu.RLock()
+			lp := lastPLI
+			pc := pliCount
+			dropped := evFramesDropped.Value()
+			stateMu.RUnlock()
+
+			log.Printf("[STATS] 幀數: %d, 帶寬: %.2f MB/s, PLI 次數: %d (last=%s), AUseq=%d, 丟棄: %d",
+				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339), auSeq, dropped)
+		}
+
+		// === 8.8 更新串流序號 ===
+		stateMu.Lock()
+		auSeq++
+		stateMu.Unlock()
+		evAuSeq.Set(int64(auSeq))
+	}
+}
+
 const (
 	controlMsgResetVideo   = 17                // TYPE_RESET_VIDEO
 	controlMsgGetClipboard = 8                 // TYPE_GET_CLIPBOARD
@@ -474,299 +735,9 @@ func main() {
 		log.Fatal(srv.ListenAndServe())
 	})
 
-	// === 5. ???P Android ?]????s?? ===
+	// === 5. 建立與 Android 設備的連接 ===
 	deviceOpts := getADBOptions()
-	session, conn, err := StartScrcpyBoot(deviceOpts)
-	if err != nil {
-		log.Fatal("[ADB] setup:", err)
-	}
-	scrcpySession = session
-	defer scrcpySession.Close()
-	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpySession.ScrcpyPort())
-	log.Println("[ADB] scrcpy server ?s?????")
-
-	// === 6. 啟動 RTP 發送器 ===
-	// 啟動專門的 goroutine 處理 RTP 封包發送，與視訊讀取解耦合
-	goSafe("rtp-sender", func() {
-		log.Println("[RTP] rtp-sender 啟動")
-		// 持續從通道中取出 RTP 載荷並發送
-		for payload := range frameChannel {
-			if payload.IsAccessUnit {
-				// 傳送一個完整的存取單元 (AU)，Marker bit 會在最後一個 NALU 的最後一個 packet 上
-				sendNALUAccessUnitAtTS(payload.NALUs, payload.RTPTimestamp)
-			} else {
-				// 傳送單獨的 NALU (例如 SPS/PPS 參數集)，不設定 Marker bit
-				sendNALUsAtTS(payload.RTPTimestamp, payload.NALUs...)
-			}
-		}
-		log.Println("[RTP] rtp-sender 停止")
-	})
-
-	// === 7. 初始化視訊串流接收 ===
-	log.Println("[VIDEO] 開始接收視訊串流")
-
-	// 讀取設備名稱（固定 64 位元組，以 NUL 結尾）
-	nameBuf := make([]byte, 64)
-	if _, err := io.ReadFull(conn.VideoStream, nameBuf); err != nil {
-		log.Fatal("[VIDEO] read device name:", err)
-	}
-	// 移除尾部的 NUL 字元並取得設備名稱
-	deviceName := string(bytes.TrimRight(nameBuf, "\x00"))
-	log.Printf("[VIDEO] 裝置名稱: %s", deviceName)
-
-	// 讀取視訊標頭資訊（12 位元組）：[codecID(u32)][width(u32)][height(u32)]
-	vHeader := make([]byte, 12)
-	if _, err := io.ReadFull(conn.VideoStream, vHeader); err != nil {
-		log.Fatal("[VIDEO] read video header:", err)
-	}
-	// 解析編碼器 ID 和初始解析度
-	codecID := binary.BigEndian.Uint32(vHeader[0:4]) // 0=H264, 1=H265, 2=AV1（依版本可能不同）
-	w0 := binary.BigEndian.Uint32(vHeader[4:8])      // 視訊寬度
-	h0 := binary.BigEndian.Uint32(vHeader[8:12])     // 視訊高度
-
-	// 更新全域視訊解析度狀態（作為觸控映射的後備值）
-	stateMu.Lock()
-	videoW, videoH = uint16(w0), uint16(h0)
-	stateMu.Unlock()
-	// 更新監控指標
-	evVideoW.Set(int64(videoW))
-	evVideoH.Set(int64(videoH))
-
-	log.Printf("[VIDEO] 編碼ID: %d, 初始解析度: %dx%d", codecID, w0, h0)
-
-	// === 8. 主要的視訊幀接收與處理迴圈 ===
-	// 初始化幀處理所需的變數
-	meta := make([]byte, 12) // 幀元資料緩衝區（PTS + 幀大小）
-	startTime = time.Now()   // 記錄開始時間用於計算處理速率
-	var frameCount int       // 已處理的幀數量計數器
-	var totalBytes int64     // 累計處理的位元組數
-
-	// 無限迴圈處理每一個視訊幀
-	for {
-		// === 8.1 讀取幀元資料 ===
-		// 測量讀取幀元資料的耗時
-		t0 := time.Now()
-		if _, err := io.ReadFull(conn.VideoStream, meta); err != nil {
-			log.Println("[VIDEO] read frame meta:", err)
-			break // 讀取失敗時退出迴圈
-		}
-		metaElapsed := time.Since(t0)
-		evLastFrameMetaMS.Set(metaElapsed.Milliseconds())
-		// 如果讀取時間過長則發出警告
-		if metaElapsed > warnFrameMetaOver {
-			log.Printf("[VIDEO] 讀 meta 偏慢: %v", metaElapsed)
-		}
-
-		// 解析幀元資料：[PTS(u64)] + [frameSize(u32)]
-		pts := binary.BigEndian.Uint64(meta[0:8])        // 呈現時間戳（微秒）
-		frameSize := binary.BigEndian.Uint32(meta[8:12]) // 幀資料大小
-
-		// === 8.2 初始化時間戳基準 ===
-		// 第一幀時建立 PTS 到 RTP 時間戳的對應關係
-		if !havePTS0 {
-			pts0 = pts // 記錄第一幀的 PTS 作為基準
-			rtpTS0 = 0 // RTP 時間戳從 0 開始
-			havePTS0 = true
-		}
-		// 計算當前幀對應的 RTP 時間戳
-		curTS := rtpTS0 + rtpTSFromPTS(pts, pts0)
-
-		// === 8.3 讀取幀資料 ===
-		// 測量讀取幀資料的耗時
-		t1 := time.Now()
-		frame := make([]byte, frameSize) // 分配幀資料緩衝區
-		if _, err := io.ReadFull(conn.VideoStream, frame); err != nil {
-			log.Println("[VIDEO] read frame:", err)
-			break // 讀取失敗時退出迴圈
-		}
-		readElapsed := time.Since(t1)
-		evLastFrameReadMS.Set(readElapsed.Milliseconds())
-		// 如果讀取時間過長則發出警告
-		if readElapsed > warnFrameReadOver {
-			log.Printf("[VIDEO] 讀 frame 偏慢: %v (size=%d)", readElapsed, frameSize)
-		}
-
-		// === 8.4 解析 H.264 位元流並分析 NALU 類型 ===
-		// 將 Annex-B 格式的位元流分割為獨立的 NALU 單元
-		nalus := splitAnnexBNALUs(frame)
-
-		// 初始化 NALU 分析變數
-		idrInThisAU := false                      // 標記此存取單元是否包含 IDR 幀
-		var gotNewSPS bool                        // 標記是否收到新的 SPS
-		var spsCnt, ppsCnt, idrCnt, othersCnt int // 各類型 NALU 的計數器
-
-		// 遍歷所有 NALU 並分析類型
-		for _, n := range nalus {
-			switch naluType(n) {
-			case 7: // SPS (Sequence Parameter Set - 序列參數集)
-				spsCnt++
-				stateMu.Lock()
-				// 檢查是否為新的 SPS（與上次快取的不同）
-				if !bytes.Equal(lastSPS, n) {
-					// 嘗試從新 SPS 中解析視訊解析度
-					if w, h, ok := parseH264SPSDimensions(n); ok {
-						videoW, videoH = w, h
-						gotNewSPS = true
-						evVideoW.Set(int64(videoW))
-						evVideoH.Set(int64(videoH))
-						log.Printf("[AU] 更新 SPS 並套用解析度 %dx%d 給觸控映射(後備)", w, h)
-					}
-				}
-				// 快取最新的 SPS
-				lastSPS = append([]byte(nil), n...)
-				stateMu.Unlock()
-			case 8: // PPS (Picture Parameter Set - 圖像參數集)
-				ppsCnt++
-				stateMu.Lock()
-				// 檢查是否為新的 PPS
-				if !bytes.Equal(lastPPS, n) {
-					log.Printf("[AU] 更新 PPS (len=%d)", len(n))
-				}
-				// 快取最新的 PPS
-				lastPPS = append([]byte(nil), n...)
-				stateMu.Unlock()
-			case 5: // IDR (Instantaneous Decoder Refresh - 即時解碼器重整幀)
-				idrCnt++
-				idrInThisAU = true // 標記此存取單元包含關鍵幀
-			default: // 其他類型的 NALU（P 幀、B 幀等）
-				othersCnt++
-			}
-		}
-		// 更新各類型 NALU 的統計計數器
-		evNALU_SPS.Add(int64(spsCnt))
-		evNALU_PPS.Add(int64(ppsCnt))
-		evNALU_IDR.Add(int64(idrCnt))
-		evNALU_Others.Add(int64(othersCnt))
-
-		// === 8.5 檢查 WebRTC 連接狀態 ===
-		// 取得當前 WebRTC 相關物件的狀態（使用讀鎖避免阻塞）
-		stateMu.RLock()
-		vt := videoTrack       // WebRTC 視訊軌道
-		pk := packetizer       // RTP 封包化器
-		waitKF := needKeyframe // 是否正在等待關鍵幀
-		stateMu.RUnlock()
-
-		// === 8.6 處理視訊資料並推送到 WebRTC ===
-		// 只有在 WebRTC 連接建立且 RTP 元件準備就緒時才處理
-		if vt != nil && pk != nil {
-			// === 8.6.1 處理 SPS 變更 ===
-			// 當收到新的 SPS（解析度可能改變）時的處理邏輯
-			if gotNewSPS {
-				// 取得最新的 SPS/PPS 參數集
-				stateMu.RLock()
-				sps := lastSPS
-				pps := lastPPS
-				stateMu.RUnlock()
-
-				// 先推送新的參數集到 RTP 通道
-				if len(sps) > 0 {
-					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
-				}
-				if len(pps) > 0 {
-					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
-				}
-
-				// 設定需要等待關鍵幀標誌並請求 IDR 幀
-				stateMu.Lock()
-				waitKF = true       // 更新本地副本
-				needKeyframe = true // 設定全域狀態
-				stateMu.Unlock()
-
-				// 向 Android 設備請求關鍵幀
-				if scrcpySession != nil {
-					scrcpySession.RequestKeyframe()
-				}
-				evKeyframeRequests.Add(1) // 更新請求計數器
-			}
-
-			// === 8.6.2 處理關鍵幀等待邏輯 ===
-			if waitKF {
-				// 取得當前的參數集
-				stateMu.RLock()
-				sps := lastSPS
-				pps := lastPPS
-				stateMu.RUnlock()
-
-				// 確保參數集已準備就緒，否則再次請求關鍵幀
-				if len(sps) > 0 && len(pps) > 0 {
-					// 推送參數集到 RTP 通道（分開推送以確保順序）
-					pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
-					pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
-				} else {
-					// 參數集尚未準備好，請求關鍵幀
-					if scrcpySession != nil {
-						scrcpySession.RequestKeyframe()
-					}
-					evKeyframeRequests.Add(1)
-				}
-
-				// 追蹤等待關鍵幀的幀數
-				framesSinceKF++
-				evFramesSinceKF.Set(int64(framesSinceKF))
-
-				// 每 30 幀重新請求一次關鍵幀（避免請求遺失）
-				if framesSinceKF%30 == 0 {
-					log.Printf("[KF] 等待 IDR 中... 已過 %d 幀；再次請求關鍵幀", framesSinceKF)
-					if scrcpySession != nil {
-						scrcpySession.RequestKeyframe()
-					}
-					evKeyframeRequests.Add(1)
-				}
-
-				// 如果當前幀不包含 IDR，跳過處理（不推送到 WebRTC）
-				if !idrInThisAU {
-					goto stats // 跳到統計更新，丟棄非 IDR 幀
-				}
-
-				// 收到 IDR 幀，可以開始正常串流
-				log.Println("[KF] 偵測到 IDR，開始送流")
-				stateMu.Lock()
-				needKeyframe = false // 清除等待關鍵幀標誌
-				framesSinceKF = 0    // 重置計數器
-				stateMu.Unlock()
-				evFramesSinceKF.Set(0)
-
-				// 推送包含 IDR 的存取單元到 RTP 通道
-				pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
-			} else {
-				// === 8.6.3 正常串流模式 ===
-				// 不需要等待關鍵幀，直接推送 P 幀或其他幀類型
-				pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
-			}
-		}
-
-		// === 8.7 更新統計資訊 ===
-	stats:
-		// 累計處理的幀數和位元組數
-		frameCount++
-		totalBytes += int64(frameSize)
-		evFramesRead.Add(1)               // 更新已讀取幀數指標
-		evBytesRead.Add(int64(frameSize)) // 更新已讀取位元組數指標
-
-		// 每隔指定數量的幀輸出統計資訊
-		if frameCount%statsLogEvery == 0 {
-			elapsed := time.Since(startTime).Seconds()
-			bytesPerSecond := float64(totalBytes) / elapsed
-
-			// 取得當前狀態用於統計輸出
-			stateMu.RLock()
-			lp := lastPLI                      // 最後一次 PLI 時間
-			pc := pliCount                     // PLI 累計次數
-			dropped := evFramesDropped.Value() // 丟幀數量
-			stateMu.RUnlock()
-
-			// 輸出詳細的處理統計資訊
-			log.Printf("[STATS] 影格: %d, 速率: %.2f MB/s, PLI 累計: %d (last=%s), AUseq=%d, 丟幀(w): %d",
-				frameCount, bytesPerSecond/(1024*1024), pc, lp.Format(time.RFC3339), auSeq, dropped)
-		}
-
-		// === 8.8 更新存取單元序號 ===
-		// 每處理完一個幀就遞增 AU 序號（用於追蹤和除錯）
-		stateMu.Lock()
-		auSeq++
-		stateMu.Unlock()
-		evAuSeq.Set(int64(auSeq))
-	} // 視訊幀處理迴圈結束
+	runAndroidStreaming(deviceOpts)
 }
 
 // === WebRTC: /offer handler ===
