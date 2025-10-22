@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"expvar"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -441,6 +442,12 @@ func handleTouchEvent(ev touchEvent) {
 // ========= 伺服器入口 =========
 
 func main() {
+	adbSerial := flag.String("adb-serial", "", "adb device serial (e.g. ip:port)")
+	adbServerHost := flag.String("adb-host", "", "adb server host (optional)")
+	adbServerPort := flag.Int("adb-port", 0, "adb server port (optional)")
+	scrcpyPortFlag := flag.Int("scrcpy-port", adb.DefaultScrcpyPort, "local TCP port for scrcpy reverse connection")
+	flag.Parse()
+
 	// 進階 log 格式（含毫秒與檔名:行號）
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	// 基礎 HTTP/除錯
@@ -467,11 +474,19 @@ func main() {
 	})
 
 	// 連線到第一台 Android 裝置
-	dev, err := adb.NewDevice("")
+	deviceOpts := adb.Options{
+		Serial:     *adbSerial,
+		ServerHost: *adbServerHost,
+		ServerPort: *adbServerPort,
+		ScrcpyPort: *scrcpyPortFlag,
+	}
+	dev, err := adb.NewDevice(deviceOpts)
 	if err != nil {
 		log.Fatal("[ADB] NewDevice:", err)
 	}
-	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", adb.ScrcpyPort)); err != nil {
+	scrcpyPort := dev.ScrcpyPort()
+	log.Printf("[ADB] target serial=%q scrcpy_port=%d", *adbSerial, scrcpyPort)
+	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", scrcpyPort)); err != nil {
 		log.Fatal("[ADB] reverse:", err)
 	}
 	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {

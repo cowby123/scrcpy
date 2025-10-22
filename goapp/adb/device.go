@@ -1,4 +1,5 @@
-// 封裝對 adb 的操作，協助在裝置上啟動 scrcpy 伺服器
+// Package adb wraps the minimal subset of adb interactions required to
+// bootstrap the scrcpy server and channel the resulting connections.
 package adb
 
 import (
@@ -7,17 +8,32 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 )
 
-// ScrcpyPort is the TCP port used by scrcpy for both video and control
+// DefaultScrcpyPort is the TCP port used by scrcpy for both video and control
 // channels. The Android server connects twice to this port: the first
-// connection carries the H.264 stream, the second is the control socket
-// for input events.
-const ScrcpyPort = 27183
+// connection carries the H.264 stream, the second is the control socket for
+// input events.
+const DefaultScrcpyPort = 27183
 
-// Device 代表一台 Android 裝置
+// Options configure how adb is invoked and which local TCP port scrcpy should
+// reach when it connects back to the host.
+type Options struct {
+	// Serial is the adb device identifier (e.g. from `adb devices` or `adb connect`).
+	Serial string
+	// ServerHost and ServerPort point to a specific adb server instance.
+	// Leave empty/zero to use adb's defaults (local server on 127.0.0.1:5037).
+	ServerHost string
+	ServerPort int
+	// ScrcpyPort is the local TCP port that the scrcpy server connects back to.
+	// Set to 0 to use DefaultScrcpyPort.
+	ScrcpyPort int
+}
+
+// Device encapsulates adb interactions with a specific target.
 type Device struct {
-	serial string
+	opts Options
 }
 
 type cmdReadCloser struct {
@@ -34,23 +50,42 @@ func (c *cmdReadCloser) Close() error {
 	return err2
 }
 
-// NewDevice 連線至 adb，並回傳指定序號的 Device
-func NewDevice(serial string) (*Device, error) {
-	cmd := exec.Command("adb", "start-server")
+func normalizeOptions(opts Options) Options {
+	if opts.ScrcpyPort == 0 {
+		opts.ScrcpyPort = DefaultScrcpyPort
+	}
+	return opts
+}
+
+func buildADBArgs(opts Options, includeSerial bool, extra ...string) []string {
+	args := make([]string, 0, 4+len(extra))
+	if opts.ServerHost != "" {
+		args = append(args, "-H", opts.ServerHost)
+	}
+	if opts.ServerPort != 0 {
+		args = append(args, "-P", strconv.Itoa(opts.ServerPort))
+	}
+	if includeSerial && opts.Serial != "" {
+		args = append(args, "-s", opts.Serial)
+	}
+	args = append(args, extra...)
+	return args
+}
+
+// NewDevice ensures the adb server is reachable and returns a configured Device.
+func NewDevice(opts Options) (*Device, error) {
+	opts = normalizeOptions(opts)
+	cmd := exec.Command("adb", buildADBArgs(opts, false, "start-server")...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("start adb server: %w (%s)", err, string(out))
 	}
-	return &Device{serial: serial}, nil
+	return &Device{opts: opts}, nil
 }
 
-// PushServer 將 scrcpy-server.jar 推送到裝置的暫存目錄
+// PushServer uploads scrcpy-server.jar into a temporary directory on device.
 func (d *Device) PushServer(localPath string) error {
 	remotePath := "/data/local/tmp/scrcpy-server.jar"
-	args := []string{}
-	if d.serial != "" {
-		args = append(args, "-s", d.serial)
-	}
-	args = append(args, "push", localPath, remotePath)
+	args := buildADBArgs(d.opts, true, "push", localPath, remotePath)
 	cmd := exec.Command("adb", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("push server: %w (%s)", err, string(out))
@@ -58,25 +93,30 @@ func (d *Device) PushServer(localPath string) error {
 	return nil
 }
 
-// ServerConn 代表與 scrcpy server 的連線
+// ServerConn holds both streams created by the scrcpy server.
 type ServerConn struct {
 	VideoStream io.ReadWriteCloser
 	Control     io.ReadWriteCloser
 }
 
-// StartServer 透過 adb shell 啟動 scrcpy 伺服器並回傳視訊串流和控制通道
+// StartServer launches scrcpy through adb shell and waits for both channels.
 func (d *Device) StartServer() (*ServerConn, error) {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ScrcpyPort))
+	addr := fmt.Sprintf("127.0.0.1:%d", d.opts.ScrcpyPort)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
 	}
 	defer ln.Close()
 
-	args := []string{}
-	if d.serial != "" {
-		args = append(args, "-s", d.serial)
-	}
-	args = append(args, "shell", "CLASSPATH=/data/local/tmp/scrcpy-server.jar", "app_process", "/", "com.genymobile.scrcpy.Server", "3.3.2", "audio=false")
+	args := buildADBArgs(d.opts, true,
+		"shell",
+		"CLASSPATH=/data/local/tmp/scrcpy-server.jar",
+		"app_process",
+		"/",
+		"com.genymobile.scrcpy.Server",
+		"3.3.2",
+		"audio=false",
+	)
 	cmd := exec.Command("adb", args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -84,13 +124,11 @@ func (d *Device) StartServer() (*ServerConn, error) {
 	}
 	go cmd.Wait()
 
-	// 等待視訊串流連線
 	videoConn, err := ln.Accept()
 	if err != nil {
 		return nil, fmt.Errorf("accept video stream: %w", err)
 	}
 
-	// 等待控制通道連線
 	controlConn, err := ln.Accept()
 	if err != nil {
 		videoConn.Close()
@@ -103,13 +141,14 @@ func (d *Device) StartServer() (*ServerConn, error) {
 	}, nil
 }
 
-// Forward 在本地建立與 scrcpy 通道的連線轉發
+// ScrcpyPort returns the effective local port used for reverse connections.
+func (d *Device) ScrcpyPort() int {
+	return d.opts.ScrcpyPort
+}
+
+// Forward sets up classic adb forward (not used in current flow but kept for parity).
 func (d *Device) Forward(local string) error {
-	args := []string{}
-	if d.serial != "" {
-		args = append(args, "-s", d.serial)
-	}
-	args = append(args, "forward", local, "localabstract:scrcpy")
+	args := buildADBArgs(d.opts, true, "forward", local, "localabstract:scrcpy")
 	cmd := exec.Command("adb", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("forward: %w (%s)", err, string(out))
@@ -117,13 +156,9 @@ func (d *Device) Forward(local string) error {
 	return nil
 }
 
-// Reverse 在裝置端建立連線，使其回連至本機指定的埠號
+// Reverse asks the device to connect back to the given local endpoint.
 func (d *Device) Reverse(remote, local string) error {
-	args := []string{}
-	if d.serial != "" {
-		args = append(args, "-s", d.serial)
-	}
-	args = append(args, "reverse", remote, local)
+	args := buildADBArgs(d.opts, true, "reverse", remote, local)
 	cmd := exec.Command("adb", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("reverse: %w (%s)", err, string(out))
