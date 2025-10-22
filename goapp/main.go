@@ -33,6 +33,40 @@ import (
 	"github.com/yourname/scrcpy-go/adb"
 )
 
+func registerADBFlags(fs *flag.FlagSet) func() adb.Options {
+	serial := fs.String("adb-serial", "", "adb device serial (e.g. ip:port)")
+	host := fs.String("adb-host", "", "adb server host (optional)")
+	port := fs.Int("adb-port", 0, "adb server port (optional)")
+	scrcpyPort := fs.Int("scrcpy-port", adb.DefaultScrcpyPort, "local TCP port for scrcpy reverse connection")
+	return func() adb.Options {
+		return adb.Options{
+			Serial:     *serial,
+			ServerHost: *host,
+			ServerPort: *port,
+			ScrcpyPort: *scrcpyPort,
+		}
+	}
+}
+
+func setupScrcpyDevice(opts adb.Options) (*adb.Device, *adb.ServerConn, error) {
+	dev, err := adb.NewDevice(opts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("new device: %w", err)
+	}
+	port := dev.ScrcpyPort()
+	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", port)); err != nil {
+		return nil, nil, fmt.Errorf("reverse: %w", err)
+	}
+	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
+		return nil, nil, fmt.Errorf("push server: %w", err)
+	}
+	conn, err := dev.StartServer()
+	if err != nil {
+		return nil, nil, fmt.Errorf("start server: %w", err)
+	}
+	return dev, conn, nil
+}
+
 const (
 	controlMsgResetVideo   = 17                // TYPE_RESET_VIDEO
 	controlMsgGetClipboard = 8                 // TYPE_GET_CLIPBOARD
@@ -442,10 +476,7 @@ func handleTouchEvent(ev touchEvent) {
 // ========= 伺服器入口 =========
 
 func main() {
-	adbSerial := flag.String("adb-serial", "", "adb device serial (e.g. ip:port)")
-	adbServerHost := flag.String("adb-host", "", "adb server host (optional)")
-	adbServerPort := flag.Int("adb-port", 0, "adb server port (optional)")
-	scrcpyPortFlag := flag.Int("scrcpy-port", adb.DefaultScrcpyPort, "local TCP port for scrcpy reverse connection")
+	getADBOptions := registerADBFlags(flag.CommandLine)
 	flag.Parse()
 
 	// 進階 log 格式（含毫秒與檔名:行號）
@@ -474,28 +505,13 @@ func main() {
 	})
 
 	// 連線到第一台 Android 裝置
-	deviceOpts := adb.Options{
-		Serial:     *adbSerial,
-		ServerHost: *adbServerHost,
-		ServerPort: *adbServerPort,
-		ScrcpyPort: *scrcpyPortFlag,
-	}
-	dev, err := adb.NewDevice(deviceOpts)
+	deviceOpts := getADBOptions()
+	dev, conn, err := setupScrcpyDevice(deviceOpts)
 	if err != nil {
-		log.Fatal("[ADB] NewDevice:", err)
+		log.Fatal("[ADB] setup:", err)
 	}
 	scrcpyPort := dev.ScrcpyPort()
-	log.Printf("[ADB] target serial=%q scrcpy_port=%d", *adbSerial, scrcpyPort)
-	if err := dev.Reverse("localabstract:scrcpy", fmt.Sprintf("tcp:%d", scrcpyPort)); err != nil {
-		log.Fatal("[ADB] reverse:", err)
-	}
-	if err := dev.PushServer("./assets/scrcpy-server"); err != nil {
-		log.Fatal("[ADB] push server:", err)
-	}
-	conn, err := dev.StartServer()
-	if err != nil {
-		log.Fatal("[ADB] start server:", err)
-	}
+	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpyPort)
 	defer conn.VideoStream.Close()
 	defer conn.Control.Close()
 	controlConn = conn.Control
