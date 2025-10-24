@@ -1,4 +1,4 @@
-// main.go — 線路格式對齊官方：觸控載荷 31B + type 1B = 總 32B；
+﻿// main.go — 線路格式對齊官方：觸控載荷 31B + type 1B = 總 32B；
 // 觸控 ≤10 指映射；mouse/pen 固定用 ID 0；忽略滑鼠 hover move；
 // DataChannel 收到控制訊號時印出原始資料並照官方順序編碼後直寫 control socket。
 // ★ 新增：control socket 讀回解析（DeviceMessage：clipboard）、心跳 GET_CLIPBOARD、寫入 deadline/耗時告警。
@@ -35,13 +35,31 @@ import (
 // registerADBFlags 註冊 ADB 相關的命令行參數並返回配置選項獲取函數
 // 用途：配置 ADB 連接參數，包括設備序號、伺服器主機、端口等
 func registerADBFlags(fs *flag.FlagSet) func() adb.Options {
-	serial := fs.String("adb-serial", "", "adb device serial (e.g. ip:port)")
-	host := fs.String("adb-host", "", "adb server host (optional)")
-	port := fs.Int("adb-port", 0, "adb server port (optional)")
-	scrcpyPort := fs.Int("scrcpy-port", adb.DefaultScrcpyPort, "local TCP port for scrcpy reverse connection")
+	// 設備序號或 IP:Port，例如：
+	// - USB 設備：序號如 "ABCD1234"
+	// - WiFi 設備：IP:Port 如 "192.168.1.100:5555"
+	// - 留空則使用第一個可用設備
+	serial := fs.String("device", "", "指定要連接的 Android 設備 (序號或 IP:Port，留空則自動選擇)")
+	
+	// 相容舊參數名稱
+	serialAlt := fs.String("adb-serial", "", "同 -device (相容舊版)")
+	
+	// ADB 伺服器設定（通常使用預設值即可）
+	host := fs.String("adb-host", "127.0.0.1", "ADB 伺服器主機位址")
+	port := fs.Int("adb-port", 5037, "ADB 伺服器端口")
+	
+	// scrcpy 本地端口設定
+	scrcpyPort := fs.Int("scrcpy-port", adb.DefaultScrcpyPort, "scrcpy 反向連接使用的本地端口")
+	
 	return func() adb.Options {
+		// 優先使用 -device，若未設定則嘗試 -adb-serial（相容性）
+		selectedSerial := *serial
+		if selectedSerial == "" && *serialAlt != "" {
+			selectedSerial = *serialAlt
+		}
+		
 		return adb.Options{
-			Serial:     *serial,
+			Serial:     selectedSerial,
 			ServerHost: *host,
 			ServerPort: *port,
 			ScrcpyPort: *scrcpyPort,
@@ -737,6 +755,17 @@ func main() {
 
 	// === 5. 建立與 Android 設備的連接 ===
 	deviceOpts := getADBOptions()
+	
+	// 顯示連接資訊
+	if deviceOpts.Serial != "" {
+		log.Printf("[ADB] 嘗試連接指定設備: %s", deviceOpts.Serial)
+	} else {
+		log.Println("[ADB] 未指定設備，將自動選擇第一個可用設備")
+		log.Println("[ADB] 提示：使用 -device 參數指定設備，例如：")
+		log.Println("[ADB]   USB 設備: -device ABCD1234")
+		log.Println("[ADB]   WiFi 設備: -device 192.168.1.100:5555")
+	}
+	
 	runAndroidStreaming(deviceOpts)
 }
 
