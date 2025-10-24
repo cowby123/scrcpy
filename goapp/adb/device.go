@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 // DefaultScrcpyPort is the TCP port used by scrcpy for both video and control
@@ -164,4 +165,53 @@ func (d *Device) Reverse(remote, local string) error {
 		return fmt.Errorf("reverse: %w (%s)", err, string(out))
 	}
 	return nil
+}
+
+// ADBDevice 代表一個 ADB 設備
+type ADBDevice struct {
+	Serial string // 設備序號或 IP:port
+	State  string // device, offline, unauthorized 等
+}
+
+// ListDevices 列出所有 ADB 可見的設備
+// 用途：執行 `adb devices` 並解析輸出
+func ListDevices(opts Options) ([]ADBDevice, error) {
+	args := buildADBArgs(opts, false, "devices")
+	cmd := exec.Command("adb", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("list devices: %w (%s)", err, string(out))
+	}
+	
+	return parseDevicesOutput(string(out)), nil
+}
+
+// parseDevicesOutput 解析 `adb devices` 的輸出
+// 格式範例：
+// List of devices attached
+// 192.168.66.102:5555	device
+// emulator-5554	offline
+func parseDevicesOutput(output string) []ADBDevice {
+	devices := []ADBDevice{}
+	
+	// 分割行
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	
+	for i, line := range lines {
+		// 跳過第一行標題 "List of devices attached"
+		if i == 0 || strings.TrimSpace(line) == "" {
+			continue
+		}
+		
+		// 格式: <serial>\t<state>
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			devices = append(devices, ADBDevice{
+				Serial: parts[0],
+				State:  parts[1],
+			})
+		}
+	}
+	
+	return devices
 }

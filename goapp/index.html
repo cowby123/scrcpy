@@ -41,6 +41,10 @@
          controlslist="nodownload noplaybackrate noremoteplayback nofullscreen"></video>
 
   <div class="row">
+    <select id="deviceSelect" style="padding:10px; border-radius:8px; border:1px solid #333; background:#1f1f1f; color:#ddd; min-width:200px;">
+      <option value="">載入中...</option>
+    </select>
+    <button id="btnRefresh">刷新設備列表</button>
     <button id="btnStart">開始連線</button>
     <button id="btnStop" disabled>中斷連線</button>
   </div>
@@ -53,6 +57,71 @@
     let pc, dcR, dcU; // reliable / unreliable
     let forceStop = false;
     const BLOCK_KEYS = [" ", "k", "MediaPlayPause"];
+    
+    // 載入設備列表
+    async function loadDevices() {
+      try {
+        const resp = await fetch('/devices');
+        const data = await resp.json();
+        const select = $("#deviceSelect");
+        select.innerHTML = '';
+        
+        if (data.devices && data.devices.length > 0) {
+          data.devices.forEach(device => {
+            const option = document.createElement('option');
+            option.value = device.ip;
+            
+            // 構建顯示文字，包含狀態和解析度資訊
+            let displayText = device.ip;
+            
+            if (device.state === 'device') {
+              displayText += ' ✓'; // 在線
+            } else if (device.state === 'offline') {
+              displayText += ' ⚠ (離線)';
+              option.disabled = true;
+            } else if (device.state === 'unauthorized') {
+              displayText += ' 🔒 (未授權)';
+              option.disabled = true;
+            } else {
+              displayText += ` (${device.state})`;
+            }
+            
+            if (device.connected && device.videoW && device.videoH) {
+              displayText += ` [已連線 ${device.videoW}x${device.videoH}]`;
+            }
+            
+            option.textContent = displayText;
+            select.appendChild(option);
+          });
+          log(`已載入 ${data.devices.length} 個設備`);
+        } else {
+          const option = document.createElement('option');
+          option.value = '';
+          option.textContent = '無可用設備';
+          select.appendChild(option);
+          log('無可用設備');
+        }
+      } catch (e) {
+        log('載入設備列表失敗:', e.message);
+        const select = $("#deviceSelect");
+        select.innerHTML = '<option value="">載入失敗</option>';
+      }
+    }
+    
+    // 獲取選中的設備 IP 作為客戶端 ID
+    function getClientId() {
+      const selectedDevice = $("#deviceSelect").value;
+      if (selectedDevice) {
+        return selectedDevice;
+      }
+      
+      // 如果沒有選擇設備，使用 URL 參數或隨機生成
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlId = urlParams.get('id');
+      if (urlId) return urlId;
+      
+      return 'client-' + Math.random().toString(36).substr(2, 9);
+    }
 
     // 追蹤目前「按住」的 pointers，便於頁面切換時補送 cancel
     const activePointers = new Set();
@@ -236,6 +305,10 @@
         $("#btnStart").disabled = true;
         $("#btnStop").disabled = false;
         forceStop = false;
+        
+        // 取得客戶端 ID
+        const clientId = getClientId();
+        log(`準備連線，客戶端 ID: ${clientId}`);
 
         pc = new RTCPeerConnection();
 
@@ -279,7 +352,8 @@
         await pc.setLocalDescription(offer);
         await waitForIceComplete(pc);
 
-        const resp = await fetch("/offer", {
+        // 發送 offer 時帶上客戶端 ID
+        const resp = await fetch(`/offer?id=${encodeURIComponent(clientId)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(pc.localDescription),
@@ -320,9 +394,12 @@
 
     $("#btnStart").addEventListener("click", start);
     $("#btnStop").addEventListener("click", stop);
+    $("#btnRefresh").addEventListener("click", loadDevices);
 
-    // 自動嘗試連線
-    start();
+    // 頁面載入時先載入設備列表
+    loadDevices().then(() => {
+      log("設備列表已載入，請選擇設備後點擊「開始連線」");
+    });
   </script>
 </body>
 </html>
