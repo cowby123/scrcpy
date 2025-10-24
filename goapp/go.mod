@@ -1,4 +1,4 @@
-module github.com/yourname/scrcpy-go
+module github.com/cowby123/scrcpy-go
 
 go 1.23.0
 

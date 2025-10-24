@@ -9,7 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/scrcpy-go/adb"
+	"github.com/cowby123/scrcpy-go/adb"
+	"github.com/cowby123/scrcpy-go/internal/utils"
 )
 
 // ScrcpySession encapsulates the lifecycle of an adb-backed scrcpy server.
@@ -105,10 +106,10 @@ func (s *ScrcpySession) StartControlLoops() {
 	if s == nil || s.control == nil {
 		return
 	}
-	goSafe("control-reader", func() {
+	utils.GoSafe("control-reader", func() {
 		s.readDeviceMessages()
 	})
-	goSafe("control-health", func() {
+	utils.GoSafe("control-health", func() {
 		s.monitorControlHealth()
 	})
 }
@@ -198,7 +199,7 @@ func (s *ScrcpySession) readDeviceMessages() {
 			s.lastCtrlRead = time.Now()
 			evCtrlReadsOK.Add(1)
 			evCtrlReadClipboardB.Add(int64(n))
-			log.Printf("[CTRL][READ] DeviceMessage.CLIPBOARD %dB: %q", n, trimString(string(buf[:n]), 200))
+			log.Printf("[CTRL][READ] DeviceMessage.CLIPBOARD %dB: %q", n, utils.TrimString(string(buf[:n]), 200))
 		default:
 			s.lastCtrlRead = time.Now()
 			evCtrlReadsOK.Add(1)
