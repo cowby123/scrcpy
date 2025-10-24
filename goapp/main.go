@@ -700,11 +700,7 @@ func handleTouchEvent(ev touchEvent) {
 // main 程式主入口函數
 // 用途：初始化 HTTP 伺服器、建立 ADB 連接、處理視訊串流和 WebRTC 連接
 func main() {
-	// === 1. 解析命令行參數 ===
-	// 註冊 ADB 相關的命令行標誌並獲取配置函數
-	const hardcodedDevice = "192.168.66.102:5555"
 
-	getADBOptions := registerADBFlags(flag.CommandLine, hardcodedDevice)
 	// 解析所有命令行參數
 	flag.Parse()
 
@@ -741,7 +737,11 @@ func main() {
 		srv := &http.Server{Addr: addr}
 		log.Fatal(srv.ListenAndServe())
 	})
+	// === 1. 解析命令行參數 ===
+	// 註冊 ADB 相關的命令行標誌並獲取配置函數
+	const hardcodedDevice = "192.168.66.102:5555"
 
+	getADBOptions := registerADBFlags(flag.CommandLine, hardcodedDevice)
 	// === 5. 建立與 Android 設備的連接 ===
 	deviceOpts := getADBOptions()
 
