@@ -186,9 +186,10 @@
     }
 
     function sendControl(payload, reliable = true) {
-      // 加上 video 原生寬高與 pointerType
+      // 加上 video 原生寬高、pointerType 與設備 IP
       payload.screenW = videoEl.videoWidth  | 0;
       payload.screenH = videoEl.videoHeight | 0;
+      payload.deviceIP = getClientId(); // 設備 IP（從選擇的設備取得）
       // 按鈕與壓力數值沿用
       if (reliable) {
         if (sendOn(dcR, payload)) return true;

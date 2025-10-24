@@ -57,9 +57,10 @@ func registerADBFlags(fs *flag.FlagSet, hardcodedDevice string) func() adb.Optio
 func runAndroidStreaming(deviceOpts adb.Options) {
 	session, conn, err := StartScrcpyBoot(deviceOpts)
 	if err != nil {
-		log.Fatal("[ADB] setup:", err)
+		log.Printf("[ADB][%s] setup 失敗: %v", deviceOpts.Serial, err)
+		return
 	}
-	
+
 	// 註冊設備到全域設備列表
 	deviceIP := deviceOpts.Serial
 	deviceSession := &DeviceSession{
@@ -68,22 +69,22 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 		Conn:      conn,
 		CreatedAt: time.Now(),
 	}
-	
+
 	devicesMu.Lock()
 	deviceSessions[deviceIP] = deviceSession
 	devicesMu.Unlock()
-	
-	scrcpySession = session
+
 	defer func() {
-		scrcpySession.Close()
+		session.Close()
 		// 從設備列表移除
 		devicesMu.Lock()
 		delete(deviceSessions, deviceIP)
 		devicesMu.Unlock()
+		log.Printf("[ADB][%s] 連接已關閉", deviceIP)
 	}()
-	
-	log.Printf("[ADB] target serial=%q scrcpy_port=%d", deviceOpts.Serial, scrcpySession.ScrcpyPort())
-	log.Println("[ADB] scrcpy server 已啟動")
+
+	log.Printf("[ADB][%s] target serial=%q scrcpy_port=%d", deviceIP, deviceOpts.Serial, session.ScrcpyPort())
+	log.Printf("[ADB][%s] scrcpy server 已啟動", deviceIP)
 
 	// === 6. 啟動 RTP 發送器 ===
 	// 啟動專門的 goroutine 處理 RTP 封包發送，與視訊讀取解耦合
@@ -131,7 +132,7 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 		ds.VideoH = uint16(h0)
 	}
 	devicesMu.Unlock()
-	
+
 	// 更新當前視訊解析度（保留全域變數作為後備）
 	stateMu.Lock()
 	videoW, videoH = uint16(w0), uint16(h0)
@@ -264,11 +265,11 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 			stateMu.Unlock()
 
 			// 請求關鍵幀（只在 SPS 變更時請求一次）
-			if scrcpySession != nil {
-				scrcpySession.RequestKeyframe()
+			if session != nil {
+				session.RequestKeyframe()
 			}
 			evKeyframeRequests.Add(1)
-			log.Println("[KF] 檢測到新 SPS，已請求關鍵幀")
+			log.Printf("[KF][%s] 檢測到新 SPS，已請求關鍵幀", deviceIP)
 		}
 
 		// === 8.7 處理關鍵幀等待邏輯 ===
@@ -282,8 +283,8 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 				pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
 				pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 			} else {
-				if scrcpySession != nil {
-					scrcpySession.RequestKeyframe()
+				if session != nil {
+					session.RequestKeyframe()
 				}
 				evKeyframeRequests.Add(1)
 			}
@@ -292,9 +293,9 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 			evFramesSinceKF.Set(int64(framesSinceKF))
 
 			if framesSinceKF%30 == 0 {
-				log.Printf("[KF] 等待 IDR 中... 已經 %d 幀；再次請求 IDR", framesSinceKF)
-				if scrcpySession != nil {
-					scrcpySession.RequestKeyframe()
+				log.Printf("[KF][%s] 等待 IDR 中... 已經 %d 幀；再次請求 IDR", deviceIP, framesSinceKF)
+				if session != nil {
+					session.RequestKeyframe()
 				}
 				evKeyframeRequests.Add(1)
 			}
@@ -425,15 +426,13 @@ type ClientSession struct {
 // DeviceSession 設備會話結構
 // 用途：管理每個 Android 設備的 scrcpy 連接和視訊流
 type DeviceSession struct {
-	DeviceIP  string            // 設備 IP 地址（如 192.168.66.102:5555）
-	Session   *ScrcpySession    // scrcpy 會話
-	Conn      *adb.ServerConn   // 視訊和控制連接
-	VideoW    uint16            // 視訊寬度
-	VideoH    uint16            // 視訊高度
-	CreatedAt time.Time         // 創建時間
+	DeviceIP  string          // 設備 IP 地址（如 192.168.66.102:5555）
+	Session   *ScrcpySession  // scrcpy 會話
+	Conn      *adb.ServerConn // 視訊和控制連接
+	VideoW    uint16          // 視訊寬度
+	VideoH    uint16          // 視訊高度
+	CreatedAt time.Time       // 創建時間
 }
-
-var scrcpySession *ScrcpySession
 
 // ====== 指標（expvar）======
 var (
@@ -602,20 +601,19 @@ func handleTouchEvent(ev touchEvent) {
 	devicesMu.RLock()
 	deviceSession, exists := deviceSessions[ev.DeviceIP]
 	devicesMu.RUnlock()
-	
+
 	if !exists || deviceSession == nil || deviceSession.Session == nil || deviceSession.Session.ControlConn() == nil {
 		log.Printf("[CTRL] 設備 %s 不可用或未連接", ev.DeviceIP)
 		return
 	}
 
-	// 取映射用的畫面寬高（前端沒帶就用後備）
-	stateMu.RLock()
-	fallbackW, fallbackH := videoW, videoH
-	stateMu.RUnlock()
+	// 取映射用的畫面寬高（從設備會話取得，前端沒帶就用設備的視訊解析度）
 	sw := ev.ScreenW
 	sh := ev.ScreenH
 	if sw == 0 || sh == 0 {
-		sw, sh = fallbackW, fallbackH
+		devicesMu.RLock()
+		sw, sh = deviceSession.VideoW, deviceSession.VideoH
+		devicesMu.RUnlock()
 	}
 
 	// 夾住座標
@@ -752,7 +750,7 @@ func handleTouchEvent(ev touchEvent) {
 
 	// 像官方：事件到就直接寫 socket（不合併、不延遲）
 	// ★ 修改：使用設備會話的 writeFull 方法
-	if deviceSession != nil && deviceSession.Session != nil {
+	if deviceSession.Session != nil {
 		_ = deviceSession.Session.writeFull(buf, criticalWriteTimeout, true)
 	}
 }
@@ -814,13 +812,13 @@ func main() {
 			ServerHost: "127.0.0.1",
 			ServerPort: 5037,
 		})
-		
+
 		if err != nil {
 			log.Printf("[ADB] 列出設備失敗: %v", err)
 			http.Error(w, fmt.Sprintf("列出設備失敗: %v", err), http.StatusInternalServerError)
 			return
 		}
-		
+
 		// 構建回應，包含設備狀態和連接資訊
 		devices := make([]map[string]interface{}, 0, len(adbDevices))
 		for _, dev := range adbDevices {
@@ -828,7 +826,7 @@ func main() {
 				"ip":    dev.Serial,
 				"state": dev.State,
 			}
-			
+
 			// 如果設備已連接，添加視訊資訊
 			devicesMu.RLock()
 			if ds, ok := deviceSessions[dev.Serial]; ok {
@@ -840,10 +838,10 @@ func main() {
 				deviceInfo["connected"] = false
 			}
 			devicesMu.RUnlock()
-			
+
 			devices = append(devices, deviceInfo)
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"devices": devices,
@@ -871,42 +869,42 @@ func main() {
 	// 獲取 ADB 基本配置
 	getADBOptions := registerADBFlags(flag.CommandLine, "")
 	baseOpts := getADBOptions()
-	
+
 	// 列出所有可用的 ADB 設備
 	log.Println("[ADB] 掃描可用設備...")
 	adbDevices, err := adb.ListDevices(baseOpts)
 	if err != nil {
 		log.Fatalf("[ADB] 列出設備失敗: %v", err)
 	}
-	
+
 	if len(adbDevices) == 0 {
 		log.Println("[ADB] 未發現任何設備，等待設備連接...")
 	} else {
 		log.Printf("[ADB] 發現 %d 個設備", len(adbDevices))
 	}
-	
+
 	// 為每個在線設備啟動 streaming goroutine
 	for _, dev := range adbDevices {
 		if dev.State != "device" {
 			log.Printf("[ADB] 跳過設備 %s (狀態: %s)", dev.Serial, dev.State)
 			continue
 		}
-		
+
 		// 為此設備創建配置
 		deviceOpts := baseOpts
 		deviceOpts.Serial = dev.Serial
-		
+
 		log.Printf("[ADB] 啟動設備連接: %s", dev.Serial)
-		
+
 		// 為每個設備啟動獨立的 streaming goroutine
 		goSafe(fmt.Sprintf("device-%s", dev.Serial), func() {
 			runAndroidStreaming(deviceOpts)
 		})
-		
+
 		// 稍微延遲，避免同時啟動太多連接
 		time.Sleep(500 * time.Millisecond)
 	}
-	
+
 	// 主程式保持運行
 	log.Println("[MAIN] 所有設備連接已啟動，主程式進入待命狀態")
 	select {} // 永久阻塞，讓 goroutines 繼續運行
@@ -925,12 +923,12 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[WebRTC] 收到 Offer 請求，設備 IP: %s", deviceIP)
-	
+
 	// 查找對應的設備會話
 	devicesMu.RLock()
 	deviceSession, exists := deviceSessions[deviceIP]
 	devicesMu.RUnlock()
-	
+
 	if !exists {
 		log.Printf("[WebRTC] 設備 %s 未連接", deviceIP)
 		http.Error(w, fmt.Sprintf("設備 %s 未連接", deviceIP), http.StatusNotFound)

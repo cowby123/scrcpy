@@ -182,7 +182,7 @@ func ListDevices(opts Options) ([]ADBDevice, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list devices: %w (%s)", err, string(out))
 	}
-	
+
 	return parseDevicesOutput(string(out)), nil
 }
 
@@ -193,16 +193,16 @@ func ListDevices(opts Options) ([]ADBDevice, error) {
 // emulator-5554	offline
 func parseDevicesOutput(output string) []ADBDevice {
 	devices := []ADBDevice{}
-	
+
 	// 分割行
 	lines := strings.Split(strings.TrimSpace(output), "\n")
-	
+
 	for i, line := range lines {
 		// 跳過第一行標題 "List of devices attached"
 		if i == 0 || strings.TrimSpace(line) == "" {
 			continue
 		}
-		
+
 		// 格式: <serial>\t<state>
 		parts := strings.Fields(line)
 		if len(parts) >= 2 {
@@ -212,6 +212,6 @@ func parseDevicesOutput(output string) []ADBDevice {
 			})
 		}
 	}
-	
+
 	return devices
 }
