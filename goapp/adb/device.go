@@ -58,18 +58,6 @@ func normalizeOptions(opts Options) Options {
 	return opts
 }
 
-// findFreePort 尋找一個可用的端口
-func findFreePort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-
-	addr := listener.Addr().(*net.TCPAddr)
-	return addr.Port, nil
-}
-
 func buildADBArgs(opts Options, includeSerial bool, extra ...string) []string {
 	args := make([]string, 0, 4+len(extra))
 	if opts.ServerHost != "" {
@@ -88,24 +76,14 @@ func buildADBArgs(opts Options, includeSerial bool, extra ...string) []string {
 // NewDevice ensures the adb server is reachable and returns a configured Device.
 func NewDevice(opts Options) (*Device, error) {
 	opts = normalizeOptions(opts)
-
-	// 如果使用默認端口，預先分配一個動態端口以避免多設備衝突
-	originalPort := opts.ScrcpyPort
-	if opts.ScrcpyPort == DefaultScrcpyPort {
-		port, err := findFreePort()
-		if err != nil {
-			return nil, fmt.Errorf("find free port: %w", err)
-		}
-		opts.ScrcpyPort = port
-		fmt.Printf("[ADB] 為設備分配動態端口: %d (原默認: %d)\n", port, originalPort)
-	}
-
 	cmd := exec.Command("adb", buildADBArgs(opts, false, "start-server")...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("start adb server: %w (%s)", err, string(out))
 	}
 	return &Device{opts: opts}, nil
-} // PushServer uploads scrcpy-server.jar into a temporary directory on device.
+}
+
+// PushServer uploads scrcpy-server.jar into a temporary directory on device.
 func (d *Device) PushServer(localPath string) error {
 	remotePath := "/data/local/tmp/scrcpy-server.jar"
 	args := buildADBArgs(d.opts, true, "push", localPath, remotePath)
