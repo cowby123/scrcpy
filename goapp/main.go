@@ -34,32 +34,19 @@ import (
 
 // registerADBFlags 註冊 ADB 相關的命令行參數並返回配置選項獲取函數
 // 用途：配置 ADB 連接參數，包括設備序號、伺服器主機、端口等
-func registerADBFlags(fs *flag.FlagSet) func() adb.Options {
-	// 設備序號或 IP:Port，例如：
-	// - USB 設備：序號如 "ABCD1234"
-	// - WiFi 設備：IP:Port 如 "192.168.1.100:5555"
-	// - 留空則使用第一個可用設備
-	serial := fs.String("device", "", "指定要連接的 Android 設備 (序號或 IP:Port，留空則自動選擇)")
-	
-	// 相容舊參數名稱
-	serialAlt := fs.String("adb-serial", "", "同 -device (相容舊版)")
-	
+func registerADBFlags(fs *flag.FlagSet, hardcodedDevice string) func() adb.Options {
+	// ★ 寫死設備位址為 192.168.66.102:5555
+
 	// ADB 伺服器設定（通常使用預設值即可）
 	host := fs.String("adb-host", "127.0.0.1", "ADB 伺服器主機位址")
 	port := fs.Int("adb-port", 5037, "ADB 伺服器端口")
-	
+
 	// scrcpy 本地端口設定
 	scrcpyPort := fs.Int("scrcpy-port", adb.DefaultScrcpyPort, "scrcpy 反向連接使用的本地端口")
-	
+
 	return func() adb.Options {
-		// 優先使用 -device，若未設定則嘗試 -adb-serial（相容性）
-		selectedSerial := *serial
-		if selectedSerial == "" && *serialAlt != "" {
-			selectedSerial = *serialAlt
-		}
-		
 		return adb.Options{
-			Serial:     selectedSerial,
+			Serial:     hardcodedDevice, // 固定使用 192.168.66.120:5555
 			ServerHost: *host,
 			ServerPort: *port,
 			ScrcpyPort: *scrcpyPort,
@@ -715,7 +702,9 @@ func handleTouchEvent(ev touchEvent) {
 func main() {
 	// === 1. 解析命令行參數 ===
 	// 註冊 ADB 相關的命令行標誌並獲取配置函數
-	getADBOptions := registerADBFlags(flag.CommandLine)
+	const hardcodedDevice = "192.168.66.102:5555"
+
+	getADBOptions := registerADBFlags(flag.CommandLine, hardcodedDevice)
 	// 解析所有命令行參數
 	flag.Parse()
 
@@ -755,17 +744,10 @@ func main() {
 
 	// === 5. 建立與 Android 設備的連接 ===
 	deviceOpts := getADBOptions()
-	
-	// 顯示連接資訊
-	if deviceOpts.Serial != "" {
-		log.Printf("[ADB] 嘗試連接指定設備: %s", deviceOpts.Serial)
-	} else {
-		log.Println("[ADB] 未指定設備，將自動選擇第一個可用設備")
-		log.Println("[ADB] 提示：使用 -device 參數指定設備，例如：")
-		log.Println("[ADB]   USB 設備: -device ABCD1234")
-		log.Println("[ADB]   WiFi 設備: -device 192.168.1.100:5555")
-	}
-	
+
+	// 顯示連接資訊（固定設備）
+	log.Printf("[ADB] 使用固定設備位址: %s", deviceOpts.Serial)
+
 	runAndroidStreaming(deviceOpts)
 }
 
