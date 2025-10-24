@@ -178,15 +178,17 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 		pts := binary.BigEndian.Uint64(meta[0:8])        // 呈現時間戳（微秒）
 		frameSize := binary.BigEndian.Uint32(meta[8:12]) // 幀大小
 
-		// === 8.2 初始化時間對齊 ===
+		// === 8.2 初始化時間對齊（使用該設備自己的時間戳映射）===
 		// 第一幀時建立 PTS 與 RTP 時間戳的對應關係
-		if !havePTS0 {
-			pts0 = pts // 記下第一幀的 PTS 作為基準
-			rtpTS0 = 0 // RTP 時間戳從 0 開始
-			havePTS0 = true
+		deviceSession.StateMu.Lock()
+		if !deviceSession.HavePTS0 {
+			deviceSession.PTS0 = pts // 記下第一幀的 PTS 作為基準
+			deviceSession.RTPTS0 = 0 // RTP 時間戳從 0 開始
+			deviceSession.HavePTS0 = true
 		}
 		// 計算當前幀的 RTP 時間戳
-		curTS := rtpTS0 + rtpTSFromPTS(pts, pts0)
+		curTS := deviceSession.RTPTS0 + rtpTSFromPTS(pts, deviceSession.PTS0)
+		deviceSession.StateMu.Unlock()
 
 		// === 8.3 讀取幀資料 ===
 		// 測量讀取幀資料耗時
@@ -246,10 +248,10 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 		evNALU_IDR.Add(int64(idrCnt))
 		evNALU_Others.Add(int64(othersCnt))
 
-		// === 8.5 檢查並處理關鍵幀等待狀態 ===
-		stateMu.RLock()
-		waitKF := needKeyframe // 使用全域狀態，而不是每次重設
-		stateMu.RUnlock()
+		// === 8.5 檢查並處理關鍵幀等待狀態（使用該設備自己的狀態）===
+		deviceSession.StateMu.RLock()
+		waitKF := deviceSession.NeedKeyframe
+		deviceSession.StateMu.RUnlock()
 
 		// === 8.6 處理 SPS 變更情況 ===
 		if gotNewSPS {
@@ -266,11 +268,11 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 			}
 
-			// 設定等待關鍵幀狀態
-			stateMu.Lock()
-			needKeyframe = true
+			// 設定等待關鍵幀狀態（使用該設備自己的狀態）
+			deviceSession.StateMu.Lock()
+			deviceSession.NeedKeyframe = true
 			waitKF = true // 更新本地副本
-			stateMu.Unlock()
+			deviceSession.StateMu.Unlock()
 
 			// 請求關鍵幀（只在 SPS 變更時請求一次）
 			if session != nil {
@@ -298,26 +300,29 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 				evKeyframeRequests.Add(1)
 			}
 
-			framesSinceKF++
-			evFramesSinceKF.Set(int64(framesSinceKF))
+			// 使用該設備自己的計數器
+			deviceSession.StateMu.Lock()
+			deviceSession.FramesSinceKF++
+			evFramesSinceKF.Set(int64(deviceSession.FramesSinceKF))
 
-			if framesSinceKF%30 == 0 {
-				log.Printf("[KF][%s] 等待 IDR 中... 已經 %d 幀；再次請求 IDR", deviceIP, framesSinceKF)
+			if deviceSession.FramesSinceKF%30 == 0 {
+				log.Printf("[KF][%s] 等待 IDR 中... 已經 %d 幀；再次請求 IDR", deviceIP, deviceSession.FramesSinceKF)
 				if session != nil {
 					session.RequestKeyframe()
 				}
 				evKeyframeRequests.Add(1)
 			}
+			deviceSession.StateMu.Unlock()
 
 			if !idrInThisAU {
 				goto stats
 			}
 
 			log.Printf("[KF][%s] 收到 IDR，恢復正常串流", deviceIP)
-			stateMu.Lock()
-			needKeyframe = false
-			framesSinceKF = 0
-			stateMu.Unlock()
+			deviceSession.StateMu.Lock()
+			deviceSession.NeedKeyframe = false
+			deviceSession.FramesSinceKF = 0
+			deviceSession.StateMu.Unlock()
 			evFramesSinceKF.Set(0)
 
 			pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
@@ -392,22 +397,14 @@ var (
 	devicesMu      sync.RWMutex
 	deviceSessions = make(map[string]*DeviceSession) // deviceIP -> device session
 
-	needKeyframe bool // 新用戶/PLI 時需要 SPS/PPS + IDR
-
 	stateMu sync.RWMutex
 
 	startTime time.Time // 速率統計
 
-	// 觀測 PLI/FIR 與 AU 序號
-	lastPLI       time.Time
-	pliCount      int
-	framesSinceKF int
-	auSeq         uint64
-
-	// PTS → RTP Timestamp 映射
-	havePTS0 bool
-	pts0     uint64
-	rtpTS0   uint32
+	// 觀測 PLI/FIR（保留作為全域觀測）
+	lastPLI  time.Time
+	pliCount int
+	auSeq    uint64
 
 	// 目前「視訊解析度」（僅作後備；主要用前端傳入的 screenW/H）
 	videoW uint16
@@ -444,6 +441,15 @@ type DeviceSession struct {
 	LastSPS []byte       // 該設備最後的 SPS
 	LastPPS []byte       // 該設備最後的 PPS
 	StateMu sync.RWMutex // 保護 SPS/PPS 的讀寫
+
+	// ★ 每個設備有自己的時間戳映射和狀態（避免多設備時間戳錯亂）
+	HavePTS0 bool   // 是否已初始化 PTS 基準
+	PTS0     uint64 // PTS 基準值
+	RTPTS0   uint32 // RTP 時間戳基準值
+
+	NeedKeyframe  bool   // 是否需要關鍵幀
+	FramesSinceKF int    // 距離上次關鍵幀的幀數
+	AuSeq         uint64 // Access Unit 序號
 }
 
 // ====== 指標（expvar）======
@@ -1043,29 +1049,41 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 				switch p := pkt.(type) {
 				case *rtcp.PictureLossIndication:
 					log.Printf("[RTCP][%s][設備:%s] 收到 PLI → needKeyframe = true", sessionID, deviceIP)
+					// 設置該設備的關鍵幀請求
+					if deviceSession != nil {
+						deviceSession.StateMu.Lock()
+						deviceSession.NeedKeyframe = true
+						deviceSession.StateMu.Unlock()
+
+						if deviceSession.Session != nil {
+							deviceSession.Session.RequestKeyframe()
+						}
+					}
 					stateMu.Lock()
-					needKeyframe = true
 					lastPLI = time.Now()
 					pliCount++
 					stateMu.Unlock()
 					evRTCP_PLI.Add(1)
 					evPLICount.Set(int64(pliCount))
-					if deviceSession != nil && deviceSession.Session != nil {
-						deviceSession.Session.RequestKeyframe()
-					}
 					evKeyframeRequests.Add(1)
 				case *rtcp.FullIntraRequest:
 					log.Printf("[RTCP][%s][設備:%s] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", sessionID, deviceIP, p.SenderSSRC, p.MediaSSRC)
+					// 設置該設備的關鍵幀請求
+					if deviceSession != nil {
+						deviceSession.StateMu.Lock()
+						deviceSession.NeedKeyframe = true
+						deviceSession.StateMu.Unlock()
+
+						if deviceSession.Session != nil {
+							deviceSession.Session.RequestKeyframe()
+						}
+					}
 					stateMu.Lock()
-					needKeyframe = true
 					lastPLI = time.Now()
 					pliCount++
 					stateMu.Unlock()
 					evRTCP_FIR.Add(1)
 					evPLICount.Set(int64(pliCount))
-					if deviceSession != nil && deviceSession.Session != nil {
-						deviceSession.Session.RequestKeyframe()
-					}
 					evKeyframeRequests.Add(1)
 				}
 			}
@@ -1168,20 +1186,18 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	<-webrtc.GatheringCompletePromise(pc)
 
-	// 初始化發送端狀態
-	stateMu.Lock()
-	needKeyframe = true // 新用戶：先送 SPS/PPS，再等 IDR
-	auSeq = 0
-	havePTS0 = false
-	pts0 = 0
-	rtpTS0 = 0
-	stateMu.Unlock()
+	// 為該設備設置關鍵幀請求（新客戶端連接時）
+	if deviceSession != nil {
+		deviceSession.StateMu.Lock()
+		deviceSession.NeedKeyframe = true
+		deviceSession.StateMu.Unlock()
 
-	// 立刻請求關鍵幀（使用該設備的 scrcpySession）
-	if deviceSession != nil && deviceSession.Session != nil {
-		deviceSession.Session.RequestKeyframe()
+		// 立刻請求關鍵幀
+		if deviceSession.Session != nil {
+			deviceSession.Session.RequestKeyframe()
+		}
+		evKeyframeRequests.Add(1)
 	}
-	evKeyframeRequests.Add(1)
 
 	// 回傳 Answer（含 ICE）
 	w.Header().Set("Content-Type", "application/json")
