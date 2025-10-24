@@ -9,7 +9,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"expvar"
 	"flag"
@@ -63,11 +65,16 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 
 	// 註冊設備到全域設備列表
 	deviceIP := deviceOpts.Serial
+	
+	// 為該設備創建專用的 frame channel
+	deviceFrameChannel := make(chan RtpPayload, rtpPayloadChannelSize)
+	
 	deviceSession := &DeviceSession{
-		DeviceIP:  deviceIP,
-		Session:   session,
-		Conn:      conn,
-		CreatedAt: time.Now(),
+		DeviceIP:     deviceIP,
+		Session:      session,
+		Conn:         conn,
+		CreatedAt:    time.Now(),
+		FrameChannel: deviceFrameChannel,
 	}
 
 	devicesMu.Lock()
@@ -76,6 +83,7 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 
 	defer func() {
 		session.Close()
+		close(deviceFrameChannel) // 關閉該設備的 frame channel
 		// 從設備列表移除
 		devicesMu.Lock()
 		delete(deviceSessions, deviceIP)
@@ -86,21 +94,21 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 	log.Printf("[ADB][%s] target serial=%q scrcpy_port=%d", deviceIP, deviceOpts.Serial, session.ScrcpyPort())
 	log.Printf("[ADB][%s] scrcpy server 已啟動", deviceIP)
 
-	// === 6. 啟動 RTP 發送器 ===
+	// === 6. 啟動 RTP 發送器（該設備專用）===
 	// 啟動專門的 goroutine 處理 RTP 封包發送，與視訊讀取解耦合
-	goSafe("rtp-sender", func() {
-		log.Println("[RTP] rtp-sender 啟動")
-		// 不斷從通道取得 RTP 負載並發送
-		for payload := range frameChannel {
+	goSafe(fmt.Sprintf("rtp-sender-%s", deviceIP), func() {
+		log.Printf("[RTP][%s] rtp-sender 啟動", deviceIP)
+		// 不斷從該設備的通道取得 RTP 負載並發送
+		for payload := range deviceFrameChannel {
 			if payload.IsAccessUnit {
 				// 發送整個存取單元 (AU)，Marker bit 會在最後一個 NALU 與最後一個 packet 上
-				sendNALUAccessUnitAtTS(payload.NALUs, payload.RTPTimestamp)
+				sendNALUAccessUnitAtTS(deviceIP, payload.NALUs, payload.RTPTimestamp)
 			} else {
 				// 發送單獨的 NALU (例如 SPS/PPS 參數)，不設定 Marker bit
-				sendNALUsAtTS(payload.RTPTimestamp, payload.NALUs...)
+				sendNALUsAtTS(deviceIP, payload.RTPTimestamp, payload.NALUs...)
 			}
 		}
-		log.Println("[RTP] rtp-sender 結束")
+		log.Printf("[RTP][%s] rtp-sender 結束", deviceIP)
 	})
 
 	// === 7. 開始視訊串流讀取 ===
@@ -252,10 +260,10 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 			stateMu.RUnlock()
 
 			if len(sps) > 0 {
-				pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
+				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
 			}
 			if len(pps) > 0 {
-				pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
+				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 			}
 
 			// 設定等待關鍵幀狀態
@@ -280,8 +288,8 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 			stateMu.RUnlock()
 
 			if len(sps) > 0 && len(pps) > 0 {
-				pushToRTPChannel(RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
-				pushToRTPChannel(RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
+				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
+				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{pps}, RTPTimestamp: curTS, IsAccessUnit: false})
 			} else {
 				if session != nil {
 					session.RequestKeyframe()
@@ -304,16 +312,16 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 				goto stats
 			}
 
-			log.Println("[KF] 收到 IDR，恢復正常串流")
+			log.Printf("[KF][%s] 收到 IDR，恢復正常串流", deviceIP)
 			stateMu.Lock()
 			needKeyframe = false
 			framesSinceKF = 0
 			stateMu.Unlock()
 			evFramesSinceKF.Set(0)
 
-			pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
+			pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
 		} else {
-			pushToRTPChannel(RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
+			pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: nalus, RTPTimestamp: curTS, IsAccessUnit: true})
 		}
 
 		// === 8.7 更新統計 ===
@@ -416,7 +424,8 @@ var (
 // ClientSession 客戶端會話結構
 // 用途：管理每個 WebRTC 客戶端的連接狀態和資源
 type ClientSession struct {
-	ID         string
+	ID         string                    // 唯一的 session ID（UUID）
+	DeviceIP   string                    // 連接的設備 IP
 	PC         *webrtc.PeerConnection
 	VideoTrack *webrtc.TrackLocalStaticRTP
 	Packetizer rtp.Packetizer
@@ -426,12 +435,13 @@ type ClientSession struct {
 // DeviceSession 設備會話結構
 // 用途：管理每個 Android 設備的 scrcpy 連接和視訊流
 type DeviceSession struct {
-	DeviceIP  string          // 設備 IP 地址（如 192.168.66.102:5555）
-	Session   *ScrcpySession  // scrcpy 會話
-	Conn      *adb.ServerConn // 視訊和控制連接
-	VideoW    uint16          // 視訊寬度
-	VideoH    uint16          // 視訊高度
-	CreatedAt time.Time       // 創建時間
+	DeviceIP     string              // 設備 IP 地址（如 192.168.66.102:5555）
+	Session      *ScrcpySession      // scrcpy 會話
+	Conn         *adb.ServerConn     // 視訊和控制連接
+	VideoW       uint16              // 視訊寬度
+	VideoH       uint16              // 視訊高度
+	CreatedAt    time.Time           // 創建時間
+	FrameChannel chan RtpPayload     // 該設備專用的 RTP 幀通道
 }
 
 // ====== 指標（expvar）======
@@ -474,31 +484,28 @@ type RtpPayload struct {
 	IsAccessUnit bool // 標記這是否是一個完整的 AU (Access Unit)，用於設定 RTP Marker bit
 }
 
-// ★ [v3] 使用了縮小後的 channel size
-var frameChannel = make(chan RtpPayload, rtpPayloadChannelSize)
-
 // ★ 推送至 RTP channel，若壅塞則丟棄
-// pushToRTPChannel 將 RTP 載荷推送到處理通道
+// pushToRTPChannel 將 RTP 載荷推送到該設備的處理通道
 // 用途：非阻塞式推送視訊幀到 RTP 通道，當通道滿時主動丟幀以降低延遲
-func pushToRTPChannel(payload RtpPayload) {
+func pushToRTPChannel(deviceFrameChannel chan RtpPayload, deviceIP string, payload RtpPayload) {
 	select {
-	case frameChannel <- payload:
+	case deviceFrameChannel <- payload:
 		// 成功推入
 	default:
 		// Channel 滿了，代表 WebRTC 端處理不過來
 		// 為了降低延遲，**主動丟棄**
-		log.Printf("[RTP] 寫入壅塞 (channel 滿)，丟棄 %d NALUs (isAU=%v)", len(payload.NALUs), payload.IsAccessUnit)
+		log.Printf("[RTP][%s] 寫入壅塞 (channel 滿)，丟棄 %d NALUs (isAU=%v)", deviceIP, len(payload.NALUs), payload.IsAccessUnit)
 		evFramesDropped.Add(1)
 	}
 }
 
 // ★ 清空 RTP channel (WebRTC 斷線時)
-// clearFrameChannel 清空 RTP 幀處理通道
+// clearFrameChannel 清空該設備的 RTP 幀處理通道
 // 用途：當 WebRTC 連接斷開時清空通道中的所有待處理幀，防止記憶體累積
-func clearFrameChannel() {
+func clearFrameChannel(deviceFrameChannel chan RtpPayload) {
 	for {
 		select {
-		case <-frameChannel:
+		case <-deviceFrameChannel:
 			// 丟棄
 		default:
 			// channel 空了
@@ -757,6 +764,17 @@ func handleTouchEvent(ev touchEvent) {
 
 // ========= 設備管理輔助函數 =========
 
+// generateSessionID 生成唯一的 session ID
+// 用途：為每個 WebRTC 連接創建唯一標識符
+func generateSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// 如果隨機數生成失敗，使用時間戳作為後備
+		return fmt.Sprintf("session-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 // getDeviceSession 根據設備 IP 獲取設備會話
 // 用途：從全域 map 中查找指定設備的連接會話
 func getDeviceSession(deviceIP string) (*DeviceSession, bool) {
@@ -978,9 +996,13 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 生成唯一的 session ID（支援多個瀏覽器窗口連接同一設備）
+	sessionID := generateSessionID()
+	
 	// 建立客戶端會話
 	session := &ClientSession{
-		ID:         deviceIP,
+		ID:         sessionID,
+		DeviceIP:   deviceIP,
 		PC:         pc,
 		VideoTrack: track,
 		Packetizer: rtp.NewPacketizer(
@@ -994,14 +1016,14 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now(),
 	}
 
-	// 註冊到全域客戶端列表
+	// 註冊到全域客戶端列表（使用唯一的 session ID 作為 key）
 	clientsMu.Lock()
-	clients[deviceIP] = session
+	clients[sessionID] = session
 	clientCount := len(clients)
 	clientsMu.Unlock()
 	evActivePeer.Set(int64(clientCount))
 
-	log.Printf("[WebRTC][%s] 客戶端已註冊，當前連接數: %d", deviceIP, clientCount)
+	log.Printf("[WebRTC][%s] 客戶端已註冊（設備: %s），當前連接數: %d", sessionID, deviceIP, clientCount)
 
 	// 讀 RTCP：PLI / FIR（使用該設備的 scrcpySession）
 	goSafe("rtcp-reader", func() {
@@ -1018,7 +1040,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			for _, pkt := range pkts {
 				switch p := pkt.(type) {
 				case *rtcp.PictureLossIndication:
-					log.Printf("[RTCP][%s] 收到 PLI → needKeyframe = true", deviceIP)
+					log.Printf("[RTCP][%s][設備:%s] 收到 PLI → needKeyframe = true", sessionID, deviceIP)
 					stateMu.Lock()
 					needKeyframe = true
 					lastPLI = time.Now()
@@ -1031,7 +1053,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 					}
 					evKeyframeRequests.Add(1)
 				case *rtcp.FullIntraRequest:
-					log.Printf("[RTCP][%s] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", deviceIP, p.SenderSSRC, p.MediaSSRC)
+					log.Printf("[RTCP][%s][設備:%s] 收到 FIR → needKeyframe = true (SenderSSRC=%d, MediaSSRC=%d)", sessionID, deviceIP, p.SenderSSRC, p.MediaSSRC)
 					stateMu.Lock()
 					needKeyframe = true
 					lastPLI = time.Now()
@@ -1050,23 +1072,23 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 	// 接前端 DataChannel（印原始資料 → 解析 → 注入）
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		log.Printf("[RTC][%s] DataChannel: %s", deviceIP, dc.Label())
+		log.Printf("[RTC][%s][設備:%s] DataChannel: %s", sessionID, deviceIP, dc.Label())
 
 		dc.OnOpen(func() {
-			log.Printf("[RTC][%s] DC open: %s", deviceIP, dc.Label())
+			log.Printf("[RTC][%s][設備:%s] DC open: %s", sessionID, deviceIP, dc.Label())
 		})
 		dc.OnClose(func() {
-			log.Printf("[RTC][%s] DC close: %s", deviceIP, dc.Label())
+			log.Printf("[RTC][%s][設備:%s] DC close: %s", sessionID, deviceIP, dc.Label())
 		})
 
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			log.Printf("[RTC][%s][DC:%s] recv isString=%v len=%d", deviceIP, dc.Label(), msg.IsString, len(msg.Data))
+			log.Printf("[RTC][%s][DC:%s] recv isString=%v len=%d", sessionID, dc.Label(), msg.IsString, len(msg.Data))
 			if msg.IsString {
 				s := string(msg.Data)
 				if len(s) > 512 {
-					log.Printf("[RTC][%s][DC:%s] data: %s ...(剩餘 %d 字元)", deviceIP, dc.Label(), s[:512], len(s)-512)
+					log.Printf("[RTC][%s][DC:%s] data: %s ...(剩餘 %d 字元)", sessionID, dc.Label(), s[:512], len(s)-512)
 				} else {
-					log.Printf("[RTC][%s][DC:%s] data: %s", deviceIP, dc.Label(), s)
+					log.Printf("[RTC][%s][DC:%s] data: %s", sessionID, dc.Label(), s)
 				}
 			} else {
 				n := 128
@@ -1075,42 +1097,55 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 				}
 				hex := fmt.Sprintf("% x", msg.Data[:n])
 				if n < len(msg.Data) {
-					log.Printf("[RTC][%s][DC:%s] data(hex %dB): %s ...(剩餘 %d bytes)", deviceIP, dc.Label(), n, hex, len(msg.Data)-n)
+					log.Printf("[RTC][%s][DC:%s] data(hex %dB): %s ...(剩餘 %d bytes)", sessionID, dc.Label(), n, hex, len(msg.Data)-n)
 				} else {
-					log.Printf("[RTC][%s][DC:%s] data(hex): %s", deviceIP, dc.Label(), hex)
+					log.Printf("[RTC][%s][DC:%s] data(hex): %s", sessionID, dc.Label(), hex)
 				}
 			}
 
 			var ev touchEvent
 			if err := json.Unmarshal(msg.Data, &ev); err != nil {
-				log.Printf("[RTC][%s][DC:%s] json.Unmarshal 失敗：%v", deviceIP, dc.Label(), err)
+				log.Printf("[RTC][%s][DC:%s] json.Unmarshal 失敗：%v", sessionID, dc.Label(), err)
 				return
 			}
-			log.Printf("[CTRL][%s] touch: type=%s id=%d x=%d y=%d pressure=%.3f buttons=%d pointerType=%s screen=%dx%d",
-				deviceIP, ev.Type, ev.ID, ev.X, ev.Y, ev.Pressure, ev.Buttons, ev.PointerType, ev.ScreenW, ev.ScreenH)
+			log.Printf("[CTRL][%s][設備:%s] touch: type=%s id=%d x=%d y=%d pressure=%.3f buttons=%d pointerType=%s screen=%dx%d",
+				sessionID, deviceIP, ev.Type, ev.ID, ev.X, ev.Y, ev.Pressure, ev.Buttons, ev.PointerType, ev.ScreenW, ev.ScreenH)
 
 			handleTouchEvent(ev)
 		})
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("[RTC][%s] PeerConnection state: %s", deviceIP, s.String())
+		log.Printf("[RTC][%s][設備:%s] PeerConnection state: %s", sessionID, deviceIP, s.String())
 		if s == webrtc.PeerConnectionStateFailed ||
 			s == webrtc.PeerConnectionStateClosed ||
 			s == webrtc.PeerConnectionStateDisconnected {
-			// 從客戶端列表移除
+			// 從客戶端列表移除（使用 session ID）
 			clientsMu.Lock()
-			delete(clients, deviceIP)
+			delete(clients, sessionID)
+			
+			// 檢查是否還有其他客戶端連接到同一設備
+			hasOtherClients := false
+			for _, otherSession := range clients {
+				if otherSession.DeviceIP == deviceIP {
+					hasOtherClients = true
+					break
+				}
+			}
 			clientCount := len(clients)
 			clientsMu.Unlock()
 			evActivePeer.Set(int64(clientCount))
 
-			log.Printf("[RTC][%s] 客戶端已移除，剩餘連接數: %d", deviceIP, clientCount)
+			log.Printf("[RTC][%s][設備:%s] 客戶端已移除，剩餘連接數: %d", sessionID, deviceIP, clientCount)
 
-			// ★ 若無客戶端，清空 channel，避免 main 迴圈阻塞並累積舊幀
-			if clientCount == 0 {
-				log.Printf("[RTP][%s] 無客戶端連線，清空 frameChannel", deviceIP)
-				clearFrameChannel()
+			// ★ 若該設備無其他客戶端，清空該設備的 channel，避免累積舊幀
+			if !hasOtherClients {
+				devicesMu.RLock()
+				if ds, ok := deviceSessions[deviceIP]; ok && ds.FrameChannel != nil {
+					log.Printf("[RTP][%s] 該設備無客戶端連線，清空 frameChannel", deviceIP)
+					clearFrameChannel(ds.FrameChannel)
+				}
+				devicesMu.RUnlock()
 			}
 		}
 	})
@@ -1167,19 +1202,21 @@ func trimString(s string, max int) string {
 }
 
 // === RTP 發送（以指定 TS）===
-// ★ 注意：這些函式現在由 'rtp-sender' goroutine 唯一呼叫
+// ★ 注意：這些函式現在由每個設備的 'rtp-sender' goroutine 唯一呼叫
 // sendNALUAccessUnitAtTS 以指定時間戳發送完整的 NALU 存取單元
-// 用途：將 H.264 存取單元（AU）打包成 RTP 封包並透過 WebRTC 發送到所有客戶端，在最後一個封包設置 Marker bit
-func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
+// 用途：將 H.264 存取單元（AU）打包成 RTP 封包並透過 WebRTC 發送到連接該設備的客戶端，在最後一個封包設置 Marker bit
+func sendNALUAccessUnitAtTS(deviceIP string, nalus [][]byte, ts uint32) {
 	if len(nalus) == 0 {
 		return
 	}
 
-	// 遍歷所有客戶端並發送
+	// 只遍歷連接到該設備的客戶端
 	clientsMu.RLock()
 	clientList := make([]*ClientSession, 0, len(clients))
 	for _, session := range clients {
-		clientList = append(clientList, session)
+		if session.DeviceIP == deviceIP {
+			clientList = append(clientList, session)
+		}
 	}
 	clientsMu.RUnlock()
 
@@ -1199,7 +1236,7 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 				p.Timestamp = ts
 				p.Marker = (i == len(nalus)-1) && (j == len(pkts)-1) // ★ Marker bit
 				if err := vt.WriteRTP(p); err != nil {
-					log.Printf("[RTP][%s] write error: %v", session.ID, err)
+					log.Printf("[RTP][%s][設備:%s] write error: %v", session.ID, deviceIP, err)
 				}
 			}
 		}
@@ -1207,13 +1244,15 @@ func sendNALUAccessUnitAtTS(nalus [][]byte, ts uint32) {
 }
 
 // sendNALUsAtTS 以指定時間戳發送單獨的 NALU 單元
-// 用途：發送獨立的 NALU（如 SPS/PPS 參數集）到所有客戶端，不設置 Marker bit，用於參數集傳輸
-func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
-	// 遍歷所有客戶端並發送
+// 用途：發送獨立的 NALU（如 SPS/PPS 參數集）到連接該設備的客戶端，不設置 Marker bit，用於參數集傳輸
+func sendNALUsAtTS(deviceIP string, ts uint32, nalus ...[]byte) {
+	// 只遍歷連接到該設備的客戶端
 	clientsMu.RLock()
 	clientList := make([]*ClientSession, 0, len(clients))
 	for _, session := range clients {
-		clientList = append(clientList, session)
+		if session.DeviceIP == deviceIP {
+			clientList = append(clientList, session)
+		}
 	}
 	clientsMu.RUnlock()
 
@@ -1233,7 +1272,7 @@ func sendNALUsAtTS(ts uint32, nalus ...[]byte) {
 				p.Timestamp = ts
 				p.Marker = false // ★ 非 AU 結尾
 				if err := vt.WriteRTP(p); err != nil {
-					log.Printf("[RTP][%s] write error: %v", session.ID, err)
+					log.Printf("[RTP][%s][設備:%s] write error: %v", session.ID, deviceIP, err)
 				}
 			}
 		}
