@@ -65,10 +65,10 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 
 	// 註冊設備到全域設備列表
 	deviceIP := deviceOpts.Serial
-	
+
 	// 為該設備創建專用的 frame channel
 	deviceFrameChannel := make(chan RtpPayload, rtpPayloadChannelSize)
-	
+
 	deviceSession := &DeviceSession{
 		DeviceIP:     deviceIP,
 		Session:      session,
@@ -112,7 +112,7 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 	})
 
 	// === 7. 開始視訊串流讀取 ===
-	log.Println("[VIDEO] 開始接收視訊串流")
+	log.Printf("[VIDEO][%s] 開始接收視訊串流", deviceIP)
 
 	// 讀取設備名稱（固定 64 位元組，以 NUL 結尾）
 	nameBuf := make([]byte, 64)
@@ -214,26 +214,26 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 			switch naluType(n) {
 			case 7: // SPS
 				spsCnt++
-				stateMu.Lock()
-				if !bytes.Equal(lastSPS, n) {
+				deviceSession.StateMu.Lock()
+				if !bytes.Equal(deviceSession.LastSPS, n) {
 					if w, h, ok := parseH264SPSDimensions(n); ok {
-						videoW, videoH = w, h
+						deviceSession.VideoW, deviceSession.VideoH = w, h
 						gotNewSPS = true
-						evVideoW.Set(int64(videoW))
-						evVideoH.Set(int64(videoH))
-						log.Printf("[AU] 新的 SPS 並成功解析解析度 %dx%d", w, h)
+						evVideoW.Set(int64(w))
+						evVideoH.Set(int64(h))
+						log.Printf("[AU][%s] 新的 SPS 並成功解析解析度 %dx%d", deviceIP, w, h)
 					}
 				}
-				lastSPS = append([]byte(nil), n...)
-				stateMu.Unlock()
+				deviceSession.LastSPS = append([]byte(nil), n...)
+				deviceSession.StateMu.Unlock()
 			case 8: // PPS
 				ppsCnt++
-				stateMu.Lock()
-				if !bytes.Equal(lastPPS, n) {
-					log.Printf("[AU] 新的 PPS (len=%d)", len(n))
+				deviceSession.StateMu.Lock()
+				if !bytes.Equal(deviceSession.LastPPS, n) {
+					log.Printf("[AU][%s] 新的 PPS (len=%d)", deviceIP, len(n))
 				}
-				lastPPS = append([]byte(nil), n...)
-				stateMu.Unlock()
+				deviceSession.LastPPS = append([]byte(nil), n...)
+				deviceSession.StateMu.Unlock()
 			case 5: // IDR
 				idrCnt++
 				idrInThisAU = true
@@ -253,11 +253,11 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 
 		// === 8.6 處理 SPS 變更情況 ===
 		if gotNewSPS {
-			// 推送最新的 SPS/PPS 參數
-			stateMu.RLock()
-			sps := lastSPS
-			pps := lastPPS
-			stateMu.RUnlock()
+			// 推送最新的 SPS/PPS 參數（使用該設備自己的參數）
+			deviceSession.StateMu.RLock()
+			sps := deviceSession.LastSPS
+			pps := deviceSession.LastPPS
+			deviceSession.StateMu.RUnlock()
 
 			if len(sps) > 0 {
 				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
@@ -282,10 +282,11 @@ func runAndroidStreaming(deviceOpts adb.Options) {
 
 		// === 8.7 處理關鍵幀等待邏輯 ===
 		if waitKF {
-			stateMu.RLock()
-			sps := lastSPS
-			pps := lastPPS
-			stateMu.RUnlock()
+			// 使用該設備自己的 SPS/PPS
+			deviceSession.StateMu.RLock()
+			sps := deviceSession.LastSPS
+			pps := deviceSession.LastPPS
+			deviceSession.StateMu.RUnlock()
 
 			if len(sps) > 0 && len(pps) > 0 {
 				pushToRTPChannel(deviceFrameChannel, deviceIP, RtpPayload{NALUs: [][]byte{sps}, RTPTimestamp: curTS, IsAccessUnit: false})
@@ -393,10 +394,6 @@ var (
 
 	needKeyframe bool // 新用戶/PLI 時需要 SPS/PPS + IDR
 
-	// H.264 參數集快取（所有客戶端共用）
-	lastSPS []byte
-	lastPPS []byte
-
 	stateMu sync.RWMutex
 
 	startTime time.Time // 速率統計
@@ -424,8 +421,8 @@ var (
 // ClientSession 客戶端會話結構
 // 用途：管理每個 WebRTC 客戶端的連接狀態和資源
 type ClientSession struct {
-	ID         string                    // 唯一的 session ID（UUID）
-	DeviceIP   string                    // 連接的設備 IP
+	ID         string // 唯一的 session ID（UUID）
+	DeviceIP   string // 連接的設備 IP
 	PC         *webrtc.PeerConnection
 	VideoTrack *webrtc.TrackLocalStaticRTP
 	Packetizer rtp.Packetizer
@@ -435,13 +432,18 @@ type ClientSession struct {
 // DeviceSession 設備會話結構
 // 用途：管理每個 Android 設備的 scrcpy 連接和視訊流
 type DeviceSession struct {
-	DeviceIP     string              // 設備 IP 地址（如 192.168.66.102:5555）
-	Session      *ScrcpySession      // scrcpy 會話
-	Conn         *adb.ServerConn     // 視訊和控制連接
-	VideoW       uint16              // 視訊寬度
-	VideoH       uint16              // 視訊高度
-	CreatedAt    time.Time           // 創建時間
-	FrameChannel chan RtpPayload     // 該設備專用的 RTP 幀通道
+	DeviceIP     string          // 設備 IP 地址（如 192.168.66.102:5555）
+	Session      *ScrcpySession  // scrcpy 會話
+	Conn         *adb.ServerConn // 視訊和控制連接
+	VideoW       uint16          // 視訊寬度
+	VideoH       uint16          // 視訊高度
+	CreatedAt    time.Time       // 創建時間
+	FrameChannel chan RtpPayload // 該設備專用的 RTP 幀通道
+
+	// ★ 每個設備有自己的 SPS/PPS 參數（避免多設備互相干擾）
+	LastSPS []byte       // 該設備最後的 SPS
+	LastPPS []byte       // 該設備最後的 PPS
+	StateMu sync.RWMutex // 保護 SPS/PPS 的讀寫
 }
 
 // ====== 指標（expvar）======
@@ -998,7 +1000,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 
 	// 生成唯一的 session ID（支援多個瀏覽器窗口連接同一設備）
 	sessionID := generateSessionID()
-	
+
 	// 建立客戶端會話
 	session := &ClientSession{
 		ID:         sessionID,
@@ -1123,7 +1125,7 @@ func handleOffer(w http.ResponseWriter, r *http.Request) {
 			// 從客戶端列表移除（使用 session ID）
 			clientsMu.Lock()
 			delete(clients, sessionID)
-			
+
 			// 檢查是否還有其他客戶端連接到同一設備
 			hasOtherClients := false
 			for _, otherSession := range clients {
