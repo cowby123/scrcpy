@@ -129,11 +129,26 @@ func (d *Device) StartServer() (*ServerConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("accept video stream: %w", err)
 	}
+	// 啟用 TCP_NODELAY 以減少小封包延遲（禁用 Nagle 演算法）
+	if tcpConn, ok := videoConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			videoConn.Close()
+			return nil, fmt.Errorf("set video TCP_NODELAY: %w", err)
+		}
+	}
 
 	controlConn, err := ln.Accept()
 	if err != nil {
 		videoConn.Close()
 		return nil, fmt.Errorf("accept control channel: %w", err)
+	}
+	// 啟用 TCP_NODELAY 以減少控制指令延遲
+	if tcpConn, ok := controlConn.(*net.TCPConn); ok {
+		if err := tcpConn.SetNoDelay(true); err != nil {
+			videoConn.Close()
+			controlConn.Close()
+			return nil, fmt.Errorf("set control TCP_NODELAY: %w", err)
+		}
 	}
 
 	return &ServerConn{
