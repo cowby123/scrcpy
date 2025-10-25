@@ -21,11 +21,13 @@ import (
 	"math"
 	"net/http"
 	_ "net/http/pprof" // 啟用 /debug/pprof
+	"os"
 	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
@@ -33,6 +35,60 @@ import (
 
 	"github.com/yourname/scrcpy-go/adb"
 )
+
+// ==================== 日誌級別控制 ====================
+type LogLevel int
+
+const (
+	LogLevelDebug  LogLevel = iota // 0 - 顯示所有日誌
+	LogLevelInfo                   // 1 - 顯示 info 和 error
+	LogLevelError                  // 2 - 只顯示 error
+	LogLevelSilent                 // 3 - 不顯示日誌
+)
+
+var (
+	currentLogLevel = LogLevelSilent // 預設級別：靜默模式
+	logOutput       = log.New(os.Stdout, "", log.LstdFlags)
+)
+
+// SetLogLevel 設定日誌級別
+func SetLogLevel(level LogLevel) {
+	currentLogLevel = level
+	if level == LogLevelSilent {
+		log.SetOutput(io.Discard)
+	} else {
+		log.SetOutput(os.Stdout)
+	}
+}
+
+// LogDebug 調試日誌（最詳細）
+func LogDebug(format string, v ...interface{}) {
+	if currentLogLevel <= LogLevelDebug {
+		logOutput.Printf("[DEBUG] "+format, v...)
+	}
+}
+
+// LogInfo 一般信息日誌
+func LogInfo(format string, v ...interface{}) {
+	if currentLogLevel <= LogLevelInfo {
+		logOutput.Printf("[INFO] "+format, v...)
+	}
+}
+
+// LogError 錯誤日誌
+func LogError(format string, v ...interface{}) {
+	if currentLogLevel <= LogLevelError {
+		logOutput.Printf("[ERROR] "+format, v...)
+	}
+}
+
+// LogFatal 致命錯誤（總是顯示並退出）
+func LogFatal(format string, v ...interface{}) {
+	logOutput.Printf("[FATAL] "+format, v...)
+	os.Exit(1)
+}
+
+// ==================== 日誌級別控制結束 ====================
 
 // registerADBFlags 註冊 ADB 相關的命令行參數並返回配置選項獲取函數
 // 用途：配置 ADB 連接參數，包括設備序號、伺服器主機、端口等
@@ -809,86 +865,91 @@ func listDevices() []string {
 // main 程式主入口函數
 // 用途：初始化 HTTP 伺服器、建立 ADB 連接、處理視訊串流和 WebRTC 連接
 func main() {
+	// 日誌級別參數
+	logLevel := flag.String("log-level", "silent", "日誌級別: debug, info, error, silent")
 
 	// 解析所有命令行參數
 	flag.Parse()
+
+	// 設定日誌級別
+	switch *logLevel {
+	case "debug":
+		SetLogLevel(LogLevelDebug)
+	case "info":
+		SetLogLevel(LogLevelInfo)
+	case "error":
+		SetLogLevel(LogLevelError)
+	case "silent":
+		SetLogLevel(LogLevelSilent)
+	default:
+		SetLogLevel(LogLevelInfo)
+	}
 
 	// === 2. 配置日誌格式 ===
 	// 設定進階 log 格式（含毫秒與檔名:行號），方便除錯
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 
-	// === 3. 設定 HTTP 路由處理器 ===
-	// 根路由：提供靜態檔案服務，主要用於前端頁面
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			// 直接提供 index.html 作為主頁
-			http.ServeFile(w, r, "index.html")
-			return
-		}
-		// 其他路徑使用檔案伺服器提供靜態資源
-		http.FileServer(http.Dir(".")).ServeHTTP(w, r)
+	// === 3. 設定 Gin 路由處理器 ===
+	// Gin 模式設定：
+	// - gin.DebugMode: 開發模式，顯示詳細日誌（預設）
+	// - gin.ReleaseMode: 生產模式，減少日誌輸出
+	// - gin.TestMode: 測試模式
+	gin.SetMode(gin.ReleaseMode) // 設置為生產模式，減少日誌
+
+	// 創建路由器（可選擇不同的創建方式）:
+	// - gin.Default(): 包含 Logger 和 Recovery 中間件
+	// - gin.New(): 不包含任何中間件，可自定義
+	router := gin.New()
+
+	// 自定義日誌中間件（可控制日誌格式和輸出）
+	router.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		// 自定義日誌格式
+		return fmt.Sprintf("[GIN] %s | %3d | %13v | %15s | %-7s %s\n",
+			param.TimeStamp.Format("2006/01/02 15:04:05"),
+			param.StatusCode,
+			param.Latency,
+			param.ClientIP,
+			param.Method,
+			param.Path,
+		)
+	}))
+
+	// 添加 Recovery 中間件（捕獲 panic）
+	router.Use(gin.Recovery())
+
+	// 根路由：提供靜態檔案服務
+	router.GET("/", func(c *gin.Context) {
+		c.File("index.html")
 	})
-	// WebRTC SDP 交換端點（支援 ID 參數）
-	// 使用方式：POST /offer 或 POST /offer?id=client123
-	http.HandleFunc("/offer", handleOffer)
-	// 設備列表端點 - 從 ADB 獲取實際設備列表
-	http.HandleFunc("/devices", func(w http.ResponseWriter, r *http.Request) {
-		// 使用 ADB 列出設備
-		adbDevices, err := adb.ListDevices(adb.Options{
-			ServerHost: "127.0.0.1",
-			ServerPort: 5037,
-		})
 
-		if err != nil {
-			log.Printf("[ADB] 列出設備失敗: %v", err)
-			http.Error(w, fmt.Sprintf("列出設備失敗: %v", err), http.StatusInternalServerError)
-			return
-		}
+	// 靜態資源
+	router.StaticFile("/web/index.html", "./web/index.html")
+	router.Static("/assets", "./assets")
 
-		// 構建回應，包含設備狀態和連接資訊
-		devices := make([]map[string]interface{}, 0, len(adbDevices))
-		for _, dev := range adbDevices {
-			deviceInfo := map[string]interface{}{
-				"ip":    dev.Serial,
-				"state": dev.State,
-			}
+	// WebRTC SDP 交換端點
+	router.POST("/offer", handleOfferGin)
 
-			// 如果設備已連接，添加視訊資訊
-			devicesMu.RLock()
-			if ds, ok := deviceSessions[dev.Serial]; ok {
-				deviceInfo["connected"] = true
-				deviceInfo["videoW"] = ds.VideoW
-				deviceInfo["videoH"] = ds.VideoH
-				deviceInfo["createdAt"] = ds.CreatedAt.Format(time.RFC3339)
-			} else {
-				deviceInfo["connected"] = false
-			}
-			devicesMu.RUnlock()
+	// 設備列表端點
+	router.GET("/devices", handleDevicesGin)
 
-			devices = append(devices, deviceInfo)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"devices": devices,
-			"count":   len(devices),
-		})
-	})
 	// 除錯用的堆疊追蹤端點
-	http.HandleFunc("/debug/stack", func(w http.ResponseWriter, r *http.Request) {
+	router.GET("/debug/stack", func(c *gin.Context) {
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write(buf[:n])
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", buf[:n])
 	})
 
+	// pprof 和 expvar 端點（需要 net/http 原生處理）
+	router.GET("/debug/pprof/*any", gin.WrapH(http.DefaultServeMux))
+	router.GET("/debug/vars", gin.WrapH(http.DefaultServeMux))
+
 	// === 4. 啟動 HTTP 伺服器 ===
-	// 使用安全的 goroutine 啟動 HTTP 伺服器（防止 panic 導致程式崩潰）
 	goSafe("http-server", func() {
 		addr := ":8080"
 		log.Println("[HTTP] 服務啟動:", addr, "（/ , /offer , /devices , /debug/pprof , /debug/vars , /debug/stack）")
-		srv := &http.Server{Addr: addr}
-		log.Fatal(srv.ListenAndServe())
+		if err := router.Run(addr); err != nil {
+			log.Fatal(err)
+		}
 	})
 
 	// === 5. 自動連接所有 ADB 設備 ===
