@@ -23,41 +23,80 @@ import (
 
 // ========= 設備連接管理 =========
 
+// connectDevice 連接單個 ADB 設備並啟動串流處理
+// 用途：為指定設備建立 scrcpy 串流連接
+// 參數：
+//   - dev: ADB 設備資訊（包含序列號、狀態等）
+//   - baseOpts: 基礎 ADB 連接選項（主機、端口等）
+func connectDevice(dev adb.ADBDevice, baseOpts adb.Options) {
+	// 檢查設備狀態，只處理狀態為 "device" 的設備
+	// 其他狀態如 "offline", "unauthorized" 等會被跳過
+	if dev.State != "device" {
+		// 輸出跳過訊息，說明設備狀態不正常
+		log.Printf("[ADB] 跳過設備 %s (狀態: %s)", dev.Serial, dev.State)
+		return // 設備狀態不正常，直接返回
+	}
+
+	// 複製基礎選項，為當前設備創建專用配置
+	deviceOpts := baseOpts
+
+	// 設定此設備的序列號（Serial），用於唯一識別設備
+	// 例如：192.168.66.120:5555 或 USB 設備的序列號
+	deviceOpts.Serial = dev.Serial
+
+	// 輸出日誌：準備啟動此設備的連接
+	log.Printf("[ADB] 啟動設備連接: %s", dev.Serial)
+
+	// 使用 goSafe 安全地啟動一個 goroutine（協程）
+	// 第一個參數是協程名稱，用於日誌追蹤和 panic 捕獲
+	// 第二個參數是要執行的函數
+	goSafe(fmt.Sprintf("device-%s", dev.Serial), func() {
+		// 在獨立的 goroutine 中運行 Android 串流處理
+		// 這樣每個設備都有自己的串流處理線程，互不影響
+		runAndroidStreaming(deviceOpts)
+	})
+}
+
 // connectAllDevices 掃描並連接所有可用的 ADB 設備
 // 用途：自動發現並為每個在線的 Android 設備建立串流連接
 func connectAllDevices() {
+	// 註冊 ADB 命令行參數（如 adb-host, adb-port 等）並獲取配置選項函數
+	// 第二個參數空字串表示不使用硬編碼的設備地址
 	getADBOptions := registerADBFlags(flag.CommandLine, "")
+
+	// 調用配置函數，獲取 ADB 連接的基礎選項（主機、端口等）
 	baseOpts := getADBOptions()
 
+	// 輸出日誌：開始掃描 ADB 設備
 	log.Println("[ADB] 掃描可用設備...")
+
+	// 調用 ADB API 列出所有連接的設備（通過 USB 或網路）
+	// 返回設備列表和可能的錯誤
 	adbDevices, err := adb.ListDevices(baseOpts)
+
+	// 如果列出設備時發生錯誤（例如 ADB 服務未啟動）
 	if err != nil {
+		// 輸出致命錯誤日誌並終止程式
 		log.Fatalf("[ADB] 列出設備失敗: %v", err)
 	}
 
+	// 如果沒有發現任何設備（列表長度為 0）
 	if len(adbDevices) == 0 {
+		// 輸出提示訊息並直接返回，不進行後續連接操作
 		log.Println("[ADB] 未發現任何設備，等待設備連接...")
 		return
 	}
 
+	// 輸出發現的設備數量
 	log.Printf("[ADB] 發現 %d 個設備", len(adbDevices))
 
-	// 為每個在線設備啟動 streaming goroutine
+	// 遍歷所有發現的設備，為每個設備建立連接
 	for _, dev := range adbDevices {
-		if dev.State != "device" {
-			log.Printf("[ADB] 跳過設備 %s (狀態: %s)", dev.Serial, dev.State)
-			continue
-		}
+		// 調用 connectDevice 函數連接當前設備
+		connectDevice(dev, baseOpts)
 
-		deviceOpts := baseOpts
-		deviceOpts.Serial = dev.Serial
-
-		log.Printf("[ADB] 啟動設備連接: %s", dev.Serial)
-
-		goSafe(fmt.Sprintf("device-%s", dev.Serial), func() {
-			runAndroidStreaming(deviceOpts)
-		})
-
+		// 延遲 500 毫秒再處理下一個設備
+		// 避免同時啟動太多連接導致系統資源瞬間壓力過大
 		time.Sleep(500 * time.Millisecond)
 	}
 }
