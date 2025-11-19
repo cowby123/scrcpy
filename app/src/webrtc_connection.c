@@ -703,7 +703,8 @@ sc_webrtc_connection_add_audio_track(struct sc_webrtc_connection *connection,
 bool
 sc_webrtc_connection_send_video_rtp(struct sc_webrtc_connection *connection,
                                     const uint8_t *data,
-                                    size_t size) {
+                                    size_t size,
+                                    int64_t pts_us) {
     assert(connection);
     assert(data);
 
@@ -717,6 +718,28 @@ sc_webrtc_connection_send_video_rtp(struct sc_webrtc_connection *connection,
     if (!connection->video_track_open) {
         LOGV("Video track not open yet, skipping packet");
         return true;  // 靜默跳過，不報錯
+    }
+
+    // 設置 RTP timestamp
+    // PTS 是微秒單位，需要轉換為秒，然後使用 libdatachannel API 轉換為 RTP timestamp
+    double pts_seconds = pts_us / 1000000.0;
+    uint32_t rtp_timestamp = 0;
+
+    int ts_result = rtcTransformSecondsToTimestamp(connection->video_track_id,
+                                                   pts_seconds,
+                                                   &rtp_timestamp);
+    if (ts_result >= 0) {
+        // 設置 RTP timestamp
+        rtcSetTrackRtpTimestamp(connection->video_track_id, rtp_timestamp);
+
+        // 每 30 幀輸出一次日誌
+        static int log_counter = 0;
+        if (log_counter++ % 30 == 0) {
+            LOGI("RTP timestamp set: pts_us=%" PRIi64 " -> rtp_ts=%u (%.3fs)",
+                 pts_us, rtp_timestamp, pts_seconds);
+        }
+    } else {
+        LOGW("Failed to convert PTS to RTP timestamp: %d", ts_result);
     }
 
     int result = rtcSendMessage(connection->video_track_id, (const char *)data,

@@ -135,9 +135,11 @@ sc_webrtc_sink_process_packets(struct sc_webrtc_sink *webrtc_sink,
 
                 // 只有在 peer connection 已建立時才發送數據
                 if (ctx && ctx->peer_connected) {
+                    // 同時傳遞 PTS 以設置正確的 RTP timestamp
                     if (!sc_webrtc_connection_send_video_rtp(ctx->connection,
                                                              test_pkt->data,
-                                                             test_pkt->size)) {
+                                                             test_pkt->size,
+                                                             test_pkt->pts)) {
                         LOGW("Failed to send test frame #%d", ctx->video_packet_count);
                     }
                 }
@@ -198,9 +200,11 @@ sc_webrtc_sink_process_packets(struct sc_webrtc_sink *webrtc_sink,
             if (ctx && ctx->peer_connected) {
                 // 直接發送整個 AVPacket 數據給 libdatachannel
                 // libdatachannel 會自動處理 RTP 封包
+                // 同時傳遞 PTS 以設置正確的 RTP timestamp
                 if (!sc_webrtc_connection_send_video_rtp(ctx->connection,
                                                          video_pkt->data,
-                                                         video_pkt->size)) {
+                                                         video_pkt->size,
+                                                         video_pkt->pts)) {
                     LOGW("Failed to send video packet #%d", ctx->video_packet_count);
                 }
             } else if (ctx && !ctx->peer_connected) {
@@ -785,9 +789,9 @@ run_webrtc_sink(void *data) {
                                   strcmp(env_test, "TRUE") == 0);
     free(env_test);
 
-    // 臨時：強制啟用測試模式
-    test_mode = true;
-    LOGI("*** FORCED TEST MODE ENABLED FOR DEBUGGING ***");
+    // 臨時：強制啟用測試模式（已關閉，使用真實 Android 串流）
+    // test_mode = true;
+    // LOGI("*** FORCED TEST MODE ENABLED FOR DEBUGGING ***");
 
     struct sc_webrtc_test_source test_source;
     bool test_source_initialized = false;

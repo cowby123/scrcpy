@@ -196,12 +196,14 @@ sc_webrtc_connection_add_audio_track(struct sc_webrtc_connection *connection,
  * @param connection WebRTC 連接實例
  * @param data RTP 數據包數據
  * @param size 數據包大小
+ * @param pts_us 視頻幀的 PTS（微秒單位），用於計算 RTP timestamp
  * @return 成功返回 true，失敗返回 false
  */
 bool
 sc_webrtc_connection_send_video_rtp(struct sc_webrtc_connection *connection,
                                     const uint8_t *data,
-                                    size_t size);
+                                    size_t size,
+                                    int64_t pts_us);
 
 /**
  * 發送 RTP 數據包到音頻軌道
