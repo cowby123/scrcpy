@@ -11,6 +11,9 @@
 #include "webrtc_signaling.h"
 #include "webrtc_connection.h"
 #include "webrtc_test_source.h"
+#include "controller.h"
+#include "control_msg.h"
+#include "coords.h"
 
 /** Downcast packet sinks to webrtc_sink */
 #define DOWNCAST_VIDEO(SINK) \
@@ -240,6 +243,184 @@ sc_webrtc_sink_process_packets(struct sc_webrtc_sink *webrtc_sink,
     }
 
     return !error;
+}
+
+// ============================================================================
+// Data Channel 消息處理（觸控事件）
+// ============================================================================
+
+// 簡單的 JSON 字符串提取函數
+static char *
+json_get_string(const char *json, const char *key) {
+    char search_key[128];
+    snprintf(search_key, sizeof(search_key), "\"%s\":\"", key);
+
+    const char *start = strstr(json, search_key);
+    if (!start) {
+        return NULL;
+    }
+
+    start += strlen(search_key);
+    const char *end = strchr(start, '"');
+    if (!end) {
+        return NULL;
+    }
+
+    size_t len = end - start;
+    char *value = malloc(len + 1);
+    if (!value) {
+        return NULL;
+    }
+
+    memcpy(value, start, len);
+    value[len] = '\0';
+    return value;
+}
+
+// 簡單的 JSON 數字提取函數
+static bool
+json_get_double(const char *json, const char *key, double *out_value) {
+    char search_key[128];
+    snprintf(search_key, sizeof(search_key), "\"%s\":", key);
+
+    const char *start = strstr(json, search_key);
+    if (!start) {
+        return false;
+    }
+
+    start += strlen(search_key);
+    // 跳過空白
+    while (*start == ' ' || *start == '\t') {
+        start++;
+    }
+
+    char *end;
+    *out_value = strtod(start, &end);
+    return end != start;
+}
+
+// 處理來自瀏覽器的觸控事件
+static void
+on_data_channel_message(struct sc_webrtc_sink *webrtc_sink,
+                        const uint8_t *message,
+                        size_t size) {
+    if (!webrtc_sink->controller) {
+        LOGW("WebRTC: received touch event but controller is not available");
+        return;
+    }
+
+    // C 端節流：最多每 16ms 處理一次觸控事件（約 60 FPS）
+    static sc_tick last_touch_time = 0;
+    static uint32_t event_count = 0;
+    static uint32_t skipped_count = 0;
+    event_count++;
+
+    sc_tick now = sc_tick_now();
+    sc_tick threshold = SC_TICK_FROM_MS(16);
+    sc_tick diff = (last_touch_time > 0) ? (now - last_touch_time) : threshold;
+
+    // 每 30 個事件記錄一次節流狀態
+    if (event_count % 30 == 0) {
+        LOGD("WebRTC Throttle: event#%u, skipped=%u, now=%lld, last=%lld, diff=%lld, threshold=%lld",
+             event_count, skipped_count, (long long)now, (long long)last_touch_time,
+             (long long)diff, (long long)threshold);
+    }
+
+    if (diff < threshold) {
+        // 跳過此事件，頻率太高
+        skipped_count++;
+        return;
+    }
+    last_touch_time = now;
+
+    // 使用靜態緩衝區代替 malloc()，避免 OOM 錯誤
+    // 最大 JSON 消息應該小於 256 bytes: {"type":"touch","action":"move","x":0.123,"y":0.456,"pointer_id":1}
+    static char json_buffer[512];
+    if (size >= sizeof(json_buffer)) {
+        LOGW("WebRTC: message too large (%zu bytes), max is %zu", size, sizeof(json_buffer) - 1);
+        return;
+    }
+
+    memcpy(json_buffer, message, size);
+    json_buffer[size] = '\0';
+    char *json = json_buffer;
+
+    // Print received raw JSON data
+    LOGI("Received touch data: %s", json);
+
+    // 解析 JSON 消息
+    char *type = json_get_string(json, "type");
+    if (!type || strcmp(type, "touch") != 0) {
+        LOGW("WebRTC: unknown message type: %s", type ? type : "(null)");
+        free(type);
+        return;
+    }
+    free(type);
+
+    char *action_str = json_get_string(json, "action");
+    double x, y, pointer_id_double;
+
+    if (!action_str || !json_get_double(json, "x", &x) ||
+        !json_get_double(json, "y", &y) ||
+        !json_get_double(json, "pointer_id", &pointer_id_double)) {
+        LOGW("WebRTC: invalid touch message format");
+        free(action_str);
+        return;
+    }
+
+    // Print parsed data
+    LOGI("Parsed touch: action=%s, x=%.4f, y=%.4f, pointer_id=%.0f",
+         action_str, x, y, pointer_id_double);
+
+    // 將 action 字符串轉換為 Android 枚舉
+    enum android_motionevent_action action;
+    const char *action_name;
+    if (strcmp(action_str, "down") == 0) {
+        action = AMOTION_EVENT_ACTION_DOWN;
+        action_name = "DOWN";
+    } else if (strcmp(action_str, "move") == 0) {
+        action = AMOTION_EVENT_ACTION_MOVE;
+        action_name = "MOVE";
+    } else if (strcmp(action_str, "up") == 0) {
+        action = AMOTION_EVENT_ACTION_UP;
+        action_name = "UP";
+    } else {
+        LOGW("WebRTC: unknown action: %s", action_str);
+        free(action_str);
+        return;
+    }
+    free(action_str);
+
+    // 構造控制消息
+    struct sc_control_msg msg;
+    msg.type = SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
+    msg.inject_touch_event.action = action;
+    msg.inject_touch_event.pointer_id = (uint64_t)pointer_id_double;
+
+    // 座標是相對座標（0-1），需要轉換為絕對座標
+    // 使用實際視訊尺寸進行轉換（與 SDL 觸控行為一致）
+    msg.inject_touch_event.position.point.x = (int32_t)(x * webrtc_sink->video_width);
+    msg.inject_touch_event.position.point.y = (int32_t)(y * webrtc_sink->video_height);
+    msg.inject_touch_event.position.screen_size.width = webrtc_sink->video_width;
+    msg.inject_touch_event.position.screen_size.height = webrtc_sink->video_height;
+
+    // Pressure: UP 動作時為 0.0，DOWN/MOVE 時為 1.0
+    bool up = action == AMOTION_EVENT_ACTION_UP;
+    msg.inject_touch_event.pressure = up ? 0.0f : 1.0f;
+    msg.inject_touch_event.action_button = 0;
+    msg.inject_touch_event.buttons = 0;
+
+    // Print final injected touch event (with converted coordinates)
+    LOGI("Injecting touch: %s [%d], relative(%.4f, %.4f), absolute(%d, %d), pointer_id=%" PRIu64,
+         action_name, action, x, y,
+         msg.inject_touch_event.position.point.x,
+         msg.inject_touch_event.position.point.y,
+         msg.inject_touch_event.pointer_id);
+
+    // 發送控制消息
+    if (!sc_controller_push_msg(webrtc_sink->controller, &msg)) {
+        LOGW("WebRTC: failed to push touch event to controller");
+    }
 }
 
 // ============================================================================
@@ -776,6 +957,20 @@ on_webrtc_keyframe_request(struct sc_webrtc_connection *connection,
     }
 }
 
+static void
+on_webrtc_data_channel_message(struct sc_webrtc_connection *connection,
+                               const uint8_t *message,
+                               size_t size,
+                               void *userdata) {
+    (void) connection;
+    struct webrtc_context *ctx = userdata;
+
+    // 轉發到 webrtc_sink 處理
+    if (ctx->sink) {
+        on_data_channel_message(ctx->sink, message, size);
+    }
+}
+
 static int
 run_webrtc_sink(void *data) {
     struct sc_webrtc_sink *webrtc_sink = data;
@@ -873,6 +1068,7 @@ run_webrtc_sink(void *data) {
         .on_data_channel_open = NULL,
         .on_error = on_webrtc_error,
         .on_keyframe_request = on_webrtc_keyframe_request,
+        .on_data_channel_message = on_webrtc_data_channel_message,
     };
 
     struct sc_webrtc_connection_config webrtc_config = {
@@ -909,6 +1105,18 @@ run_webrtc_sink(void *data) {
                 webrtc_ok = false;
             } else {
                 LOGI("Audio track created and Opus packetizer configured");
+            }
+        }
+
+        // 創建 data channel（必須在添加所有 tracks 之後，創建 offer 之前）
+        // 注意：rtcCreateDataChannel 會觸發 SDP 生成，所以必須在 tracks 都加完之後調用
+        if (webrtc_ok && webrtc_sink->controller) {
+            LOGI("Creating data channel for touch control");
+            if (!sc_webrtc_connection_create_data_channel(ctx.connection, "control")) {
+                LOGE("Failed to create data channel");
+                webrtc_ok = false;
+            } else {
+                LOGI("Data channel created successfully");
             }
         }
 
@@ -1000,6 +1208,10 @@ sc_webrtc_sink_video_packet_sink_open(struct sc_packet_sink *sink,
 
     LOGI("WebRTC sink: video opened, codec=%s, size=%dx%d",
          avcodec_get_name(ctx->codec_id), ctx->width, ctx->height);
+
+    // 保存視訊尺寸（用於觸控座標轉換）
+    webrtc_sink->video_width = ctx->width;
+    webrtc_sink->video_height = ctx->height;
 
     // TODO: 階段3.3 - 初始化 RTP 打包器（視頻）
 
@@ -1158,6 +1370,7 @@ sc_webrtc_sink_audio_packet_sink_disable(struct sc_packet_sink *sink) {
 bool
 sc_webrtc_sink_init(struct sc_webrtc_sink *webrtc_sink, uint16_t http_port,
                     const char *stun_server, bool video, bool audio,
+                    struct sc_controller *controller,
                     const struct sc_webrtc_sink_callbacks *cbs,
                     void *cbs_userdata) {
     assert(video || audio);
@@ -1196,6 +1409,7 @@ sc_webrtc_sink_init(struct sc_webrtc_sink *webrtc_sink, uint16_t http_port,
 
     webrtc_sink->webrtc_context = NULL;
     webrtc_sink->signaling_server = NULL;
+    webrtc_sink->controller = controller;
 
     webrtc_sink->cbs = cbs;
     webrtc_sink->cbs_userdata = cbs_userdata;

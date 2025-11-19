@@ -11,6 +11,9 @@
 #include "util/thread.h"
 #include "util/vecdeque.h"
 
+// 前向聲明
+struct sc_controller;
+
 struct sc_webrtc_sink_queue SC_VECDEQUE(AVPacket *);
 
 struct sc_webrtc_sink {
@@ -43,9 +46,16 @@ struct sc_webrtc_sink {
     bool video_init;
     bool audio_init;
 
+    /* 視訊尺寸（用於觸控座標轉換）*/
+    uint32_t video_width;
+    uint32_t video_height;
+
     /* WebRTC 連接狀態（後續階段實現）*/
     void *webrtc_context;  // 指向 WebRTC 上下文的不透明指針
     void *signaling_server;  // 指向信令服務器的不透明指針
+
+    /* 控制器（用於發送觸控事件到 Android）*/
+    struct sc_controller *controller;
 
     /* 回調接口 */
     const struct sc_webrtc_sink_callbacks *cbs;
@@ -83,6 +93,7 @@ struct sc_webrtc_sink_callbacks {
  * @param stun_server STUN 服務器地址（可為 NULL）
  * @param video 是否啟用視頻傳輸
  * @param audio 是否啟用音頻傳輸
+ * @param controller 控制器實例（用於發送觸控事件，可為 NULL）
  * @param cbs 回調函數結構（可為 NULL）
  * @param cbs_userdata 回調函數用戶數據
  * @return 成功返回 true，失敗返回 false
@@ -90,6 +101,7 @@ struct sc_webrtc_sink_callbacks {
 bool
 sc_webrtc_sink_init(struct sc_webrtc_sink *webrtc_sink, uint16_t http_port,
                     const char *stun_server, bool video, bool audio,
+                    struct sc_controller *controller,
                     const struct sc_webrtc_sink_callbacks *cbs,
                     void *cbs_userdata);
 

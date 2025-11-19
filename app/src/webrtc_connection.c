@@ -24,6 +24,7 @@ struct sc_webrtc_connection {
     int pc_id;              // PeerConnection ID
     int video_track_id;     // 視頻軌道 ID
     int audio_track_id;     // 音頻軌道 ID
+    int data_channel_id;    // Data Channel ID（用於觸控控制）
 
     // ICE gathering 同步機制
     char *pending_description;      // 待發送的 SDP（等待 ICE gathering 完成）
@@ -55,6 +56,55 @@ struct sc_webrtc_connection {
 // ============================================================================
 // libdatachannel 回調函數
 // ============================================================================
+
+static void
+on_data_channel_open_callback(int dc, void *user_ptr) {
+    struct sc_webrtc_connection *connection = user_ptr;
+    (void) dc;
+
+    LOGI("WebRTC: data channel opened (id=%d)", dc);
+
+    // 觸發 data channel 開啟回調
+    if (connection->cbs && connection->cbs->on_data_channel_open) {
+        connection->cbs->on_data_channel_open(connection, connection->cbs_userdata);
+    }
+}
+
+static void
+on_data_channel_message_callback(int dc, const char *message, int size, void *user_ptr) {
+    struct sc_webrtc_connection *connection = user_ptr;
+    (void) dc;
+
+    // libdatachannel 約定：
+    // - size < 0: null-terminated 字符串
+    // - size >= 0: 二進制數據，長度為 size
+    size_t actual_size;
+    if (size < 0) {
+        // null-terminated 字符串，計算實際長度
+        actual_size = strlen(message);
+        LOGD("WebRTC: data channel text message received, length=%zu", actual_size);
+    } else {
+        // 二進制數據
+        actual_size = (size_t)size;
+        LOGD("WebRTC: data channel binary message received, size=%zu", actual_size);
+    }
+
+    // 觸發 data channel 消息回調
+    if (connection->cbs && connection->cbs->on_data_channel_message) {
+        connection->cbs->on_data_channel_message(connection,
+                                                  (const uint8_t *)message,
+                                                  actual_size,
+                                                  connection->cbs_userdata);
+    }
+}
+
+static void
+on_data_channel_error_callback(int dc, const char *error, void *user_ptr) {
+    (void) dc;
+    (void) user_ptr;
+
+    LOGE("WebRTC: data channel error: %s", error);
+}
 
 static void
 on_description_callback(int pc, const char *sdp, const char *type,
@@ -381,6 +431,7 @@ sc_webrtc_connection_init(struct sc_webrtc_connection **connection,
     conn->pc_id = pc;
     conn->video_track_id = -1;
     conn->audio_track_id = -1;
+    conn->data_channel_id = -1;
 
     // 初始化 ICE gathering 同步機制
     conn->pending_description = NULL;
@@ -789,6 +840,38 @@ sc_webrtc_connection_send_audio_rtp(struct sc_webrtc_connection *connection,
     return true;
 #else
     // Placeholder
+    return true;
+#endif
+}
+
+bool
+sc_webrtc_connection_create_data_channel(struct sc_webrtc_connection *connection,
+                                         const char *label) {
+    assert(connection);
+    assert(label);
+
+#ifdef HAVE_LIBDATACHANNEL
+    LOGD("WebRTC: creating data channel, label=%s", label);
+
+    // 創建 data channel
+    int dc = rtcCreateDataChannel(connection->pc_id, label);
+    if (dc < 0) {
+        LOGE("Failed to create data channel: %d", dc);
+        return false;
+    }
+
+    connection->data_channel_id = dc;
+    LOGI("WebRTC: data channel created (id=%d, label=%s)", dc, label);
+
+    // 設置 data channel 回調
+    rtcSetUserPointer(dc, connection);
+    rtcSetOpenCallback(dc, on_data_channel_open_callback);
+    rtcSetMessageCallback(dc, on_data_channel_message_callback);
+    rtcSetErrorCallback(dc, on_data_channel_error_callback);
+
+    return true;
+#else
+    LOGD("WebRTC: would create data channel, label=%s (placeholder)", label);
     return true;
 #endif
 }

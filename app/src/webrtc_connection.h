@@ -92,6 +92,19 @@ struct sc_webrtc_connection_callbacks {
      */
     void (*on_keyframe_request)(struct sc_webrtc_connection *connection,
                                void *userdata);
+
+    /**
+     * 當收到 Data Channel 消息時調用
+     *
+     * @param connection WebRTC 連接實例
+     * @param message 消息數據
+     * @param size 消息大小
+     * @param userdata 用戶數據
+     */
+    void (*on_data_channel_message)(struct sc_webrtc_connection *connection,
+                                   const uint8_t *message,
+                                   size_t size,
+                                   void *userdata);
 };
 
 /**
@@ -217,6 +230,17 @@ bool
 sc_webrtc_connection_send_audio_rtp(struct sc_webrtc_connection *connection,
                                     const uint8_t *data,
                                     size_t size);
+
+/**
+ * 創建 Data Channel（用於雙向數據通信，如觸控控制）
+ *
+ * @param connection WebRTC 連接實例
+ * @param label Data Channel 標籤（例如："control"）
+ * @return 成功返回 true，失敗返回 false
+ */
+bool
+sc_webrtc_connection_create_data_channel(struct sc_webrtc_connection *connection,
+                                         const char *label);
 
 /**
  * 獲取當前連接狀態

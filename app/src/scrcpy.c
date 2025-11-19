@@ -686,39 +686,7 @@ scrcpy(struct scrcpy_options *options) {
         }
     }
 
-    bool webrtc_sink_initialized = false;
-    bool webrtc_sink_started = false;
-    if (options->webrtc) {
-        static const struct sc_webrtc_sink_callbacks webrtc_cbs = {
-            .on_connected = sc_webrtc_sink_on_connected,
-            .on_disconnected = sc_webrtc_sink_on_disconnected,
-            .on_error = sc_webrtc_sink_on_error,
-            .on_request_keyframe = sc_webrtc_sink_on_request_keyframe,
-        };
-        if (!sc_webrtc_sink_init(&s->webrtc_sink, options->webrtc_port,
-                                 options->webrtc_stun_server, options->video,
-                                 options->audio, &webrtc_cbs, s)) {
-            goto end;
-        }
-        webrtc_sink_initialized = true;
-
-        if (!sc_webrtc_sink_start(&s->webrtc_sink)) {
-            goto end;
-        }
-        webrtc_sink_started = true;
-
-        if (options->video) {
-            sc_packet_source_add_sink(&s->video_demuxer.packet_source,
-                                      &s->webrtc_sink.video_packet_sink);
-        }
-        if (options->audio) {
-            sc_packet_source_add_sink(&s->audio_demuxer.packet_source,
-                                      &s->webrtc_sink.audio_packet_sink);
-        }
-
-        LOGI("WebRTC sink started on port %d", options->webrtc_port);
-    }
-
+    // WebRTC sink 需要 controller 來處理觸控事件，所以先初始化 controller
     struct sc_controller *controller = NULL;
     struct sc_key_processor *kp = NULL;
     struct sc_mouse_processor *mp = NULL;
@@ -884,6 +852,40 @@ aoa_complete:
 
     // There is a controller if and only if control is enabled
     assert(options->control == !!controller);
+
+    // 初始化 WebRTC sink（在 controller 之後，以便可以使用觸控控制）
+    bool webrtc_sink_initialized = false;
+    bool webrtc_sink_started = false;
+    if (options->webrtc) {
+        static const struct sc_webrtc_sink_callbacks webrtc_cbs = {
+            .on_connected = sc_webrtc_sink_on_connected,
+            .on_disconnected = sc_webrtc_sink_on_disconnected,
+            .on_error = sc_webrtc_sink_on_error,
+            .on_request_keyframe = sc_webrtc_sink_on_request_keyframe,
+        };
+        if (!sc_webrtc_sink_init(&s->webrtc_sink, options->webrtc_port,
+                                 options->webrtc_stun_server, options->video,
+                                 options->audio, controller, &webrtc_cbs, s)) {
+            goto end;
+        }
+        webrtc_sink_initialized = true;
+
+        if (!sc_webrtc_sink_start(&s->webrtc_sink)) {
+            goto end;
+        }
+        webrtc_sink_started = true;
+
+        if (options->video) {
+            sc_packet_source_add_sink(&s->video_demuxer.packet_source,
+                                      &s->webrtc_sink.video_packet_sink);
+        }
+        if (options->audio) {
+            sc_packet_source_add_sink(&s->audio_demuxer.packet_source,
+                                      &s->webrtc_sink.audio_packet_sink);
+        }
+
+        LOGI("WebRTC sink started on port %d", options->webrtc_port);
+    }
 
     if (options->window) {
         const char *window_title =
