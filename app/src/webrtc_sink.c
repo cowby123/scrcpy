@@ -28,6 +28,10 @@ struct webrtc_context {
 
     // 連接狀態標記
     bool peer_connected;  // WebRTC peer connection 是否已建立並連接
+    bool needs_recreation;  // 連接是否需要重建（斷線後）
+
+    // 連接重建保護
+    sc_mutex connection_mutex;  // 保護連接重建過程
 
     // SDP offer/answer 同步機制（Offerer 模式）
     sc_mutex offer_mutex;
@@ -49,6 +53,10 @@ struct webrtc_context {
 
     // 數據包計數器（用於日誌和 keyframe 請求）
     int video_packet_count;
+
+    // 保存配置以便重建連接
+    struct sc_webrtc_connection_config saved_config;
+    struct sc_webrtc_connection_callbacks saved_callbacks;
 };
 
 static AVPacket *
@@ -74,6 +82,9 @@ sc_webrtc_sink_queue_clear(struct sc_webrtc_sink_queue *queue) {
         av_packet_free(&p);
     }
 }
+
+// 前向聲明：重建 WebRTC 連接（定義在後面）
+static bool recreate_connection(struct webrtc_context *ctx);
 
 static bool
 sc_webrtc_sink_process_packets(struct sc_webrtc_sink *webrtc_sink,
@@ -591,6 +602,22 @@ on_signaling_get_offer(struct sc_webrtc_signaling *signaling,
 
     LOGI("Signaling: browser requesting SDP offer");
 
+    // 檢查是否需要重建連接（使用 mutex 保護）
+    sc_mutex_lock(&ctx->connection_mutex);
+    if (ctx->needs_recreation) {
+        LOGI("WebRTC: connection needs recreation, rebuilding...");
+        bool success = recreate_connection(ctx);
+        sc_mutex_unlock(&ctx->connection_mutex);
+
+        if (!success) {
+            LOGE("Failed to recreate WebRTC connection");
+            return NULL;
+        }
+        LOGI("WebRTC: connection recreated successfully");
+    } else {
+        sc_mutex_unlock(&ctx->connection_mutex);
+    }
+
     if (!ctx->connection) {
         LOGE("WebRTC connection not initialized");
         return NULL;
@@ -877,6 +904,89 @@ on_webrtc_ice_candidate(struct sc_webrtc_connection *connection,
     }
 }
 
+// 重建 WebRTC 連接（在斷線後重連時使用）
+static bool
+recreate_connection(struct webrtc_context *ctx) {
+    LOGI("WebRTC: recreating connection for reconnection");
+
+    // 1. 銷毀舊連接
+    if (ctx->connection) {
+        LOGD("WebRTC: destroying old connection");
+        sc_webrtc_connection_destroy(ctx->connection);
+        ctx->connection = NULL;
+    }
+
+    // 2. 重置 offer/answer 狀態
+    sc_mutex_lock(&ctx->offer_mutex);
+    free(ctx->pending_offer);
+    ctx->pending_offer = NULL;
+    ctx->offer_ready = false;
+    sc_mutex_unlock(&ctx->offer_mutex);
+
+    sc_mutex_lock(&ctx->answer_mutex);
+    free(ctx->pending_answer);
+    ctx->pending_answer = NULL;
+    ctx->answer_ready = false;
+    sc_mutex_unlock(&ctx->answer_mutex);
+
+    // 3. 創建新的 PeerConnection
+    bool webrtc_ok = sc_webrtc_connection_init(&ctx->connection,
+                                               &ctx->saved_config,
+                                               &ctx->saved_callbacks, ctx);
+    if (!webrtc_ok) {
+        LOGE("Failed to recreate WebRTC connection");
+        return false;
+    }
+
+    LOGI("WebRTC: new PeerConnection created");
+
+    // 4. 主動創建 tracks
+    if (ctx->saved_config.video_enabled) {
+        if (!sc_webrtc_connection_add_video_track(ctx->connection, "video")) {
+            LOGE("Failed to add video track during recreation");
+            sc_webrtc_connection_destroy(ctx->connection);
+            ctx->connection = NULL;
+            return false;
+        }
+        LOGI("Video track recreated");
+    }
+
+    if (ctx->saved_config.audio_enabled) {
+        if (!sc_webrtc_connection_add_audio_track(ctx->connection, "audio")) {
+            LOGE("Failed to add audio track during recreation");
+            sc_webrtc_connection_destroy(ctx->connection);
+            ctx->connection = NULL;
+            return false;
+        }
+        LOGI("Audio track recreated");
+    }
+
+    // 5. 創建 data channel（如果有 controller）
+    if (ctx->sink && ctx->sink->controller) {
+        if (!sc_webrtc_connection_create_data_channel(ctx->connection, "control")) {
+            LOGE("Failed to create data channel during recreation");
+            sc_webrtc_connection_destroy(ctx->connection);
+            ctx->connection = NULL;
+            return false;
+        }
+        LOGI("Data channel recreated");
+    }
+
+    // 6. 創建 offer
+    if (!sc_webrtc_connection_create_offer(ctx->connection)) {
+        LOGE("Failed to create offer during recreation");
+        sc_webrtc_connection_destroy(ctx->connection);
+        ctx->connection = NULL;
+        return false;
+    }
+
+    LOGI("WebRTC: connection recreated successfully, offer initiated");
+    ctx->needs_recreation = false;
+    ctx->peer_connected = false;
+
+    return true;
+}
+
 static void
 on_webrtc_state_change(struct sc_webrtc_connection *connection,
                       enum sc_webrtc_connection_state state,
@@ -914,6 +1024,9 @@ on_webrtc_state_change(struct sc_webrtc_connection *connection,
         case SC_WEBRTC_STATE_DISCONNECTED:
             state_str = "DISCONNECTED";
             ctx->peer_connected = false;
+            ctx->needs_recreation = true;  // 標記需要重建連接
+
+            LOGI("WebRTC: peer disconnected, will recreate connection on next offer request");
 
             // 觸發 WebRTC sink 的 on_disconnected 回調
             if (ctx->sink && ctx->sink->cbs && ctx->sink->cbs->on_disconnected) {
@@ -923,10 +1036,16 @@ on_webrtc_state_change(struct sc_webrtc_connection *connection,
         case SC_WEBRTC_STATE_FAILED:
             state_str = "FAILED";
             ctx->peer_connected = false;
+            ctx->needs_recreation = true;  // 標記需要重建連接
+
+            LOGI("WebRTC: connection failed, will recreate connection on next offer request");
             break;
         case SC_WEBRTC_STATE_CLOSED:
             state_str = "CLOSED";
             ctx->peer_connected = false;
+            ctx->needs_recreation = true;  // 標記需要重建連接
+
+            LOGI("WebRTC: connection closed, will recreate connection on next offer request");
             break;
     }
 
@@ -1010,6 +1129,7 @@ run_webrtc_sink(void *data) {
         .connection = NULL,
         .signaling = NULL,
         .peer_connected = false,  // 初始狀態：未連接
+        .needs_recreation = false,  // 初始狀態：不需要重建
         .pending_answer = NULL,
         .answer_ready = false,
         .sink = webrtc_sink,  // 保存 sink 指針以便觸發回調
@@ -1017,14 +1137,17 @@ run_webrtc_sink(void *data) {
         .video_packet_count = 0,  // 視頻包計數器
     };
 
-    // 初始化同步機制（Offerer 模式和 Answerer 模式）
+    // 初始化同步機制（Offerer 模式、Answerer 模式和連接重建）
+    bool connection_mutex_ok = sc_mutex_init(&ctx.connection_mutex);
     bool offer_mutex_ok = sc_mutex_init(&ctx.offer_mutex);
     bool offer_cond_ok = sc_cond_init(&ctx.offer_cond);
     bool answer_mutex_ok = sc_mutex_init(&ctx.answer_mutex);
     bool answer_cond_ok = sc_cond_init(&ctx.answer_cond);
 
-    if (!offer_mutex_ok || !offer_cond_ok || !answer_mutex_ok || !answer_cond_ok) {
+    if (!connection_mutex_ok || !offer_mutex_ok || !offer_cond_ok ||
+        !answer_mutex_ok || !answer_cond_ok) {
         LOGE("Failed to initialize synchronization primitives");
+        if (connection_mutex_ok) sc_mutex_destroy(&ctx.connection_mutex);
         if (offer_mutex_ok) sc_mutex_destroy(&ctx.offer_mutex);
         if (offer_cond_ok) sc_cond_destroy(&ctx.offer_cond);
         if (answer_mutex_ok) sc_mutex_destroy(&ctx.answer_mutex);
@@ -1079,6 +1202,10 @@ run_webrtc_sink(void *data) {
         .video_enabled = webrtc_sink->video,
         .audio_enabled = webrtc_sink->audio,
     };
+
+    // 保存配置和回調以便重連時使用
+    ctx.saved_config = webrtc_config;
+    ctx.saved_callbacks = webrtc_cbs;
 
     bool webrtc_ok = sc_webrtc_connection_init(&ctx.connection, &webrtc_config,
                                                &webrtc_cbs, &ctx);
@@ -1165,6 +1292,7 @@ run_webrtc_sink(void *data) {
     free(ctx.pending_answer);
     sc_cond_destroy(&ctx.answer_cond);
     sc_mutex_destroy(&ctx.answer_mutex);
+    sc_mutex_destroy(&ctx.connection_mutex);
 
     // 清理測試源
     if (test_source_initialized) {
