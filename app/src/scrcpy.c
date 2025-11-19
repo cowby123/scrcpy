@@ -26,6 +26,7 @@
 #include "recorder.h"
 #include "screen.h"
 #include "server.h"
+#include "webrtc_sink.h"
 #include "uhid/gamepad_uhid.h"
 #include "uhid/keyboard_uhid.h"
 #include "uhid/mouse_uhid.h"
@@ -54,6 +55,7 @@ struct scrcpy {
     struct sc_decoder video_decoder;
     struct sc_decoder audio_decoder;
     struct sc_recorder recorder;
+    struct sc_webrtc_sink webrtc_sink;
     struct sc_delay_buffer video_buffer;
 #ifdef HAVE_V4L2
     struct sc_v4l2_sink v4l2_sink;
@@ -267,6 +269,58 @@ sc_recorder_on_ended(struct sc_recorder *recorder, bool success,
 
     if (!success) {
         sc_push_event(SC_EVENT_RECORDER_ERROR);
+    }
+}
+
+static void
+sc_webrtc_sink_on_connected(struct sc_webrtc_sink *webrtc_sink,
+                            void *userdata) {
+    (void) webrtc_sink;
+    (void) userdata;
+
+    LOGI("WebRTC client connected");
+
+    // 注意：不主動請求 keyframe，依賴瀏覽器通過 RTCP PLI/FIR 訊息請求
+    // 主動發送 RESET_VIDEO 會導致視頻編碼器重置，可能造成視頻流中斷
+    // 瀏覽器會在需要時自動發送 RTCP PLI (Picture Loss Indication) 訊息
+}
+
+static void
+sc_webrtc_sink_on_disconnected(struct sc_webrtc_sink *webrtc_sink,
+                               void *userdata) {
+    (void) webrtc_sink;
+    (void) userdata;
+
+    LOGI("WebRTC client disconnected");
+}
+
+static void
+sc_webrtc_sink_on_error(struct sc_webrtc_sink *webrtc_sink, const char *error,
+                        void *userdata) {
+    (void) webrtc_sink;
+    (void) userdata;
+
+    LOGE("WebRTC error: %s", error);
+}
+
+static void
+sc_webrtc_sink_on_request_keyframe(struct sc_webrtc_sink *webrtc_sink,
+                                   void *userdata) {
+    (void) webrtc_sink;
+    struct scrcpy *s = userdata;
+
+    LOGI("WebRTC sink requested keyframe");
+
+    // 發送 RESET_VIDEO 控制消息到 Android，請求重新發送關鍵幀
+    if (s && s->controller.control_socket != SC_SOCKET_NONE) {
+        struct sc_control_msg msg;
+        msg.type = SC_CONTROL_MSG_TYPE_RESET_VIDEO;
+
+        if (!sc_controller_push_msg(&s->controller, &msg)) {
+            LOGW("Failed to request video reset for WebRTC keyframe");
+        } else {
+            LOGI("Requested keyframe from Android for WebRTC (triggered by first RTP packet)");
+        }
     }
 }
 
@@ -632,6 +686,39 @@ scrcpy(struct scrcpy_options *options) {
         }
     }
 
+    bool webrtc_sink_initialized = false;
+    bool webrtc_sink_started = false;
+    if (options->webrtc) {
+        static const struct sc_webrtc_sink_callbacks webrtc_cbs = {
+            .on_connected = sc_webrtc_sink_on_connected,
+            .on_disconnected = sc_webrtc_sink_on_disconnected,
+            .on_error = sc_webrtc_sink_on_error,
+            .on_request_keyframe = sc_webrtc_sink_on_request_keyframe,
+        };
+        if (!sc_webrtc_sink_init(&s->webrtc_sink, options->webrtc_port,
+                                 options->webrtc_stun_server, options->video,
+                                 options->audio, &webrtc_cbs, s)) {
+            goto end;
+        }
+        webrtc_sink_initialized = true;
+
+        if (!sc_webrtc_sink_start(&s->webrtc_sink)) {
+            goto end;
+        }
+        webrtc_sink_started = true;
+
+        if (options->video) {
+            sc_packet_source_add_sink(&s->video_demuxer.packet_source,
+                                      &s->webrtc_sink.video_packet_sink);
+        }
+        if (options->audio) {
+            sc_packet_source_add_sink(&s->audio_demuxer.packet_source,
+                                      &s->webrtc_sink.audio_packet_sink);
+        }
+
+        LOGI("WebRTC sink started on port %d", options->webrtc_port);
+    }
+
     struct sc_controller *controller = NULL;
     struct sc_key_processor *kp = NULL;
     struct sc_mouse_processor *mp = NULL;
@@ -989,6 +1076,9 @@ end:
     if (recorder_initialized) {
         sc_recorder_stop(&s->recorder);
     }
+    if (webrtc_sink_initialized) {
+        sc_webrtc_sink_stop(&s->webrtc_sink);
+    }
     if (screen_initialized) {
         sc_screen_interrupt(&s->screen);
     }
@@ -1051,6 +1141,13 @@ end:
     }
     if (recorder_initialized) {
         sc_recorder_destroy(&s->recorder);
+    }
+
+    if (webrtc_sink_started) {
+        sc_webrtc_sink_join(&s->webrtc_sink);
+    }
+    if (webrtc_sink_initialized) {
+        sc_webrtc_sink_destroy(&s->webrtc_sink);
     }
 
     if (file_pusher_initialized) {

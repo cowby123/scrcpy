@@ -30,6 +30,11 @@ src = [
     'src/packet_merger.c',
     'src/receiver.c',
     'src/recorder.c',
+    'src/webrtc_sink.c',
+    'src/webrtc_signaling.c',
+    'src/webrtc_connection.c',
+    'src/rtp_packetizer.c',
+    'src/webrtc_test_source.c',
     'src/scrcpy.c',
     'src/screen.c',
     'src/server.c',
@@ -127,6 +132,10 @@ endif
 if usb_support
     dependencies += dependency('libusb-1.0', static: static)
 endif
+
+# WebRTC support - add libmicrohttpd and libdatachannel
+dependencies += cc.find_library('microhttpd', required: false)
+dependencies += cc.find_library('datachannel', required: false)
 
 if host_machine.system() == 'windows'
     dependencies += cc.find_library('mingw32')

@@ -113,6 +113,10 @@ const struct scrcpy_options scrcpy_options_default = {
     .angle = NULL,
     .vd_destroy_content = true,
     .vd_system_decorations = true,
+    // WebRTC defaults
+    .webrtc = false,
+    .webrtc_port = 8080,
+    .webrtc_stun_server = NULL,
 };
 
 enum sc_orientation

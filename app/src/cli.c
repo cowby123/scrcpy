@@ -114,6 +114,9 @@ enum {
     OPT_NO_VD_SYSTEM_DECORATIONS,
     OPT_NO_VD_DESTROY_CONTENT,
     OPT_DISPLAY_IME_POLICY,
+    OPT_WEBRTC,
+    OPT_WEBRTC_PORT,
+    OPT_WEBRTC_STUN_SERVER,
 };
 
 struct sc_option {
@@ -1062,6 +1065,27 @@ static const struct sc_option options[] = {
         .argdesc = "value",
         .text = "Set the initial window height.\n"
                 "Default is 0 (automatic).",
+    },
+    {
+        .longopt_id = OPT_WEBRTC,
+        .longopt = "webrtc",
+        .text = "Enable WebRTC streaming. Video and audio will be "
+                "accessible via a web browser at http://localhost:<port>/\n"
+                "Default port is 8080 (use --webrtc-port to change).",
+    },
+    {
+        .longopt_id = OPT_WEBRTC_PORT,
+        .longopt = "webrtc-port",
+        .argdesc = "port",
+        .text = "Set the HTTP port for WebRTC signaling server.\n"
+                "Default is 8080.",
+    },
+    {
+        .longopt_id = OPT_WEBRTC_STUN_SERVER,
+        .longopt = "webrtc-stun-server",
+        .argdesc = "url",
+        .text = "Set a custom STUN server URL for WebRTC NAT traversal.\n"
+                "Example: stun:stun.l.google.com:19302",
     },
 };
 
@@ -2539,6 +2563,17 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 break;
             case OPT_WINDOW_BORDERLESS:
                 opts->window_borderless = true;
+                break;
+            case OPT_WEBRTC:
+                opts->webrtc = true;
+                break;
+            case OPT_WEBRTC_PORT:
+                if (!parse_port(optarg, &opts->webrtc_port)) {
+                    return false;
+                }
+                break;
+            case OPT_WEBRTC_STUN_SERVER:
+                opts->webrtc_stun_server = optarg;
                 break;
             case OPT_PUSH_TARGET:
                 opts->push_target = optarg;
